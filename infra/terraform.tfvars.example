@@ -1,0 +1,6 @@
+account_id  = "0123456789abcdef0123456789abcdef"
+hostname    = "timer.example.com"
+owner_email = "you@example.com"
+
+access_org_name    = "my-team.cloudflareaccess.com"
+access_auth_domain = "my-team.cloudflareaccess.com"

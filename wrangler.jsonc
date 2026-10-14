@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "timer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Лише власний домен під Cloudflare Access. workers.dev і preview-URL
+  // вимкнені: інакше Worker був би доступний в обхід Access.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "timer.kopachev.life", "custom_domain": true }],
+
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/hooks/*", "/mcp"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "timer",
+      // terraform -chdir=infra output -raw d1_database_id
+      "database_id": "376725de-2097-401e-a265-7c129c21ae58",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Закриває записи агентів, від яких давно не було heartbeat.
+  "triggers": { "crons": ["*/5 * * * *"] },
+
+  "vars": {
+    "TIMEZONE": "Europe/Kyiv",
+    "STALE_MINUTES": "20",
+    "LONG_RUNNING_HOURS": "8",
+    // "false" — не зберігати початок промпту як нотатку запису.
+    "NOTE_FROM_PROMPT": "true",
+    // Заповніть після terraform apply, щоб Worker перевіряв JWT від Access.
+    // Порожні значення = перевірка вимкнена (зручно для wrangler dev).
+    "ACCESS_TEAM_DOMAIN": "kopachev.cloudflareaccess.com",
+    "ACCESS_AUD": "4876cff8556c13f405939cf7d916589222d53dc7c2e6601a08dde989ac176ced"
+  },
+
+  "observability": { "enabled": true }
+}

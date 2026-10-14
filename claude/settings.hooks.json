@@ -1,0 +1,151 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://timer.example.com/hooks/claude",
+            "timeout": 5,
+            "headers": {
+              "CF-Access-Client-Id": "$TIMER_CF_ID",
+              "CF-Access-Client-Secret": "$TIMER_CF_SECRET",
+              "X-Project-Dir": "$CLAUDE_PROJECT_DIR"
+            },
+            "allowedEnvVars": [
+              "TIMER_CF_ID",
+              "TIMER_CF_SECRET",
+              "CLAUDE_PROJECT_DIR"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

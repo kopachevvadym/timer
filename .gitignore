@@ -1,0 +1,18 @@
+node_modules/
+.wrangler/
+.dev.vars
+worker-configuration.d.ts
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/terraform.tfvars
+infra/.terraform.lock.hcl.bak
+
+# Локальні секрети деплою
+.cf-token
+.claudeai-connector.txt
+
+# Інше
+.DS_Store
+infra/*.plan
+*.log

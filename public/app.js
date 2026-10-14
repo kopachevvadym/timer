@@ -1,0 +1,1330 @@
+// Веб-інтерфейс трекера. Без збірки: звичайний ES-модуль, маршрути через #hash.
+// Дані з API вставляються лише як текст (textContent) — без innerHTML.
+
+const state = {
+  tz: 'Europe/Kyiv',
+  offset: 0, // Date.now() сервера − Date.now() браузера
+  projects: [], // усі, разом з архівними
+  now: null, // останній /api/now
+  reports: { period: 'this_week', mode: 'full' },
+  entries: { period: 'this_week', q: '', selected: null, creating: false, data: null },
+  projectsView: { showArchived: false },
+};
+
+const PALETTE = ['#2B59FF', '#F26B1D', '#0E9F8E', '#7C5CFF', '#D23C8C', '#B98A00', '#8A8A83'];
+const PERIODS = [
+  ['today', 'Сьогодні'],
+  ['yesterday', 'Вчора'],
+  ['this_week', 'Тиждень'],
+  ['last_week', 'Мин. тиждень'],
+  ['this_month', 'Місяць'],
+  ['last_month', 'Мин. місяць'],
+];
+const MODES = [
+  ['full', 'Повний', 'Кожен проєкт отримує весь свій час — сума більша за реальний, якщо агенти працювали паралельно.'],
+  ['split', 'Поділ', 'Паралельний час ділиться порівну між проєктами — сума дорівнює реальному часу.'],
+  ['focus', 'Фокус', 'Час іде проєкту, на який ви переключились останнім (ручний таймер або промпт агенту).'],
+];
+
+// ───────── утиліти
+
+const serverNow = () => Date.now() + state.offset;
+
+class AuthError extends Error {}
+
+async function api(path, opts = {}) {
+  let res;
+  try {
+    res = await fetch(`/api${path}`, {
+      method: opts.method || (opts.body ? 'POST' : 'GET'),
+      headers: opts.body ? { 'content-type': 'application/json' } : {},
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      credentials: 'same-origin',
+      redirect: 'manual',
+    });
+  } catch {
+    throw new AuthError('Немає зв’язку із сервером або сесія Cloudflare Access закінчилась — оновіть сторінку');
+  }
+  if (res.type === 'opaqueredirect' || res.status === 401) {
+    throw new AuthError('Сесія Cloudflare Access закінчилась — оновіть сторінку');
+  }
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function el(tag, attrs = {}, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === 'class') n.className = v;
+    else if (k === 'style' && typeof v === 'object') for (const [sk, sv] of Object.entries(v)) n.style.setProperty(sk, sv);
+    else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+    else if (k === 'value') n.value = v;
+    else n.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of children.flat(Infinity)) if (c !== null && c !== undefined && c !== false) n.append(c);
+  return n;
+}
+
+// Іконки — лише константні рядки.
+const ICONS = {
+  play: '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.8v8.4L10 6z"/></svg>',
+  x: '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="m2.5 2.5 7 7M9.5 2.5l-7 7"/></svg>',
+  stop: '<svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="1.2" fill="currentColor" stroke="none"/></svg>',
+};
+function icon(name) {
+  const t = document.createElement('template');
+  t.innerHTML = ICONS[name];
+  return t.content.firstChild;
+}
+
+function hm(ms) {
+  const min = Math.max(0, Math.round(ms / 60000));
+  return `${Math.floor(min / 60)}:${String(min % 60).padStart(2, '0')}`;
+}
+function hms(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+function waitText(ms) {
+  const min = Math.max(0, Math.floor(ms / 60000));
+  if (min < 1) return '<1 хв';
+  if (min < 60) return `${min} хв`;
+  return hm(ms);
+}
+function pct(x) {
+  return `${Math.round(x * 100)}%`;
+}
+
+const fmtCache = new Map();
+function fmt(key, opts) {
+  const k = `${key}|${state.tz}`;
+  if (!fmtCache.has(k)) fmtCache.set(k, new Intl.DateTimeFormat(opts.locale || 'uk-UA', { timeZone: state.tz, ...opts }));
+  return fmtCache.get(k);
+}
+const timeOf = (ms) => fmt('time', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(ms);
+const hourOf = (ms) => fmt('hour', { hour: '2-digit', hourCycle: 'h23' }).format(ms).padStart(2, '0');
+const dayKey = (ms) => fmt('key', { locale: 'en-CA', year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
+const dayTitle = (ms) => fmt('daytitle', { weekday: 'short', day: 'numeric', month: 'long' }).format(ms);
+function localInput(ms) {
+  // значення для <input type="datetime-local"> у часовому поясі сервера
+  const p = Object.fromEntries(
+    fmt('parts', { locale: 'en-CA', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+      .formatToParts(ms)
+      .map((x) => [x.type, x.value]),
+  );
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+const fromInput = (v) => (v ? v.replace('T', ' ') : undefined);
+
+function hash(s) {
+  let h = 0;
+  for (const ch of s) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return h;
+}
+function projectById(id) {
+  return state.projects.find((p) => p.id === id);
+}
+// Колір без явного: за порядком створення проєкту — перші шість не повторюються.
+function colorOf(projectId, explicit) {
+  const c = explicit ?? projectById(projectId)?.color;
+  if (c) return c;
+  const order = [...state.projects].sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
+  const i = order.findIndex((p) => p.id === projectId);
+  return PALETTE[(i >= 0 ? i : hash(projectId || '')) % (PALETTE.length - 1)];
+}
+
+// Сповіщення Claude Code приходять англійською — перекладаємо типові.
+function reasonText(r) {
+  if (!r) return null;
+  const perm = r.match(/permission to use (.+)$/i);
+  if (perm) return `просить дозволу: ${perm[1]}`;
+  if (/waiting for your input/i.test(r)) return 'чекає на вашу відповідь';
+  return r;
+}
+function dot(projectId, explicit, cls = '') {
+  return el('span', { class: `dot ${cls}`, 'aria-hidden': 'true', style: { '--c': colorOf(projectId, explicit) } });
+}
+function refTitle(ref, title) {
+  return [ref ? el('span', { class: 'mono' }, ref) : null, ref ? ' ' : null, title];
+}
+
+let toastTimer;
+function toast(msg, isErr = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = `toast on${isErr ? ' err' : ''}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.className = 'toast'), isErr ? 5000 : 2200);
+}
+
+async function act(fn, ok) {
+  try {
+    const r = await fn();
+    if (ok) toast(ok);
+    return r;
+  } catch (e) {
+    toast(e.message, true);
+    throw e;
+  }
+}
+
+// Кнопка, що просить другого натискання (без confirm()).
+function confirmButton(label, confirmLabel, onConfirm, cls = 'btn sm ghost danger') {
+  let armed = false;
+  let timer;
+  const b = el('button', { type: 'button', class: cls }, label);
+  b.addEventListener('click', async () => {
+    if (!armed) {
+      armed = true;
+      b.textContent = confirmLabel;
+      timer = setTimeout(() => {
+        armed = false;
+        b.textContent = label;
+      }, 3500);
+      return;
+    }
+    clearTimeout(timer);
+    b.disabled = true;
+    try {
+      await onConfirm();
+    } finally {
+      b.disabled = false;
+    }
+  });
+  return b;
+}
+function iconConfirm(name, ariaLabel, onConfirm) {
+  let armed = false;
+  let timer;
+  const b = el('button', { type: 'button', class: 'btn icon ghost', 'aria-label': ariaLabel, title: ariaLabel }, icon(name));
+  b.addEventListener('click', async () => {
+    if (!armed) {
+      armed = true;
+      b.classList.add('danger');
+      b.title = 'Натисніть ще раз';
+      timer = setTimeout(() => {
+        armed = false;
+        b.classList.remove('danger');
+        b.title = ariaLabel;
+      }, 3500);
+      return;
+    }
+    clearTimeout(timer);
+    await onConfirm();
+  });
+  return b;
+}
+
+function seg(options, current, onPick, label) {
+  return el(
+    'div',
+    { class: 'seg', role: 'group', 'aria-label': label },
+    options.map(([v, text, title]) =>
+      el('button', { type: 'button', 'aria-pressed': String(v === current), title, onclick: () => onPick(v) }, text),
+    ),
+  );
+}
+
+async function loadProjects() {
+  state.projects = await api('/projects?archived=1');
+}
+
+// ───────── маршрутизація
+
+const view = document.getElementById('view');
+let renderSeq = 0;
+let pollTimer = null;
+
+function route() {
+  const [name = 'now', arg] = location.hash.replace(/^#/, '').split('/');
+  return { name: ['now', 'reports', 'entries', 'projects'].includes(name) ? name : 'now', arg: arg ? decodeURIComponent(arg) : null };
+}
+
+async function render() {
+  const seq = ++renderSeq;
+  const r = route();
+  for (const a of document.querySelectorAll('[data-route]')) {
+    if (a.dataset.route === r.name) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  }
+  document.querySelector('.shell').classList.toggle('wide', r.name === 'entries' || r.name === 'projects');
+  clearInterval(pollTimer);
+  try {
+    const node = await VIEWS[r.name](r.arg);
+    if (seq !== renderSeq) return;
+    view.replaceChildren(node);
+    document.title = `${{ now: 'Зараз', reports: 'Звіти', entries: 'Записи', projects: 'Проєкти' }[r.name]} · Timer`;
+    tick();
+  } catch (e) {
+    if (seq !== renderSeq) return;
+    view.replaceChildren(el('div', { class: 'card empty' }, e.message));
+  }
+  if (r.name === 'now') pollTimer = setInterval(() => !document.hidden && refresh(), 15000);
+}
+
+async function refresh() {
+  // перерендер поточного екрана без скидання вибору
+  await render();
+}
+
+// Живі лічильники: [data-since] — скільки минуло, [data-wait] — скільки чекає.
+function tick() {
+  const now = serverNow();
+  for (const n of document.querySelectorAll('[data-since]')) n.textContent = hms(now - Number(n.dataset.since));
+  for (const n of document.querySelectorAll('[data-wait]')) {
+    const ms = now - Number(n.dataset.wait);
+    n.textContent = waitText(ms);
+    n.classList.toggle('danger', ms > 10 * 60000);
+  }
+  for (const n of document.querySelectorAll('[data-run]')) n.textContent = hm(Number(n.dataset.base) + (now - Number(n.dataset.run)));
+}
+setInterval(tick, 1000);
+
+// ───────── Зараз
+
+async function viewNow() {
+  const [now] = await Promise.all([api('/now'), loadProjects()]);
+  state.now = now;
+  state.offset = now.now - Date.now();
+  state.tz = now.timezone || state.tz;
+  const frag = el('div', { class: 'stack', style: { gap: '32px' } });
+
+  // Чекають на вас
+  if (now.waiting.length) {
+    frag.append(
+      el(
+        'section',
+        { class: 'section', 'aria-labelledby': 'wait-h' },
+        el('h1', { id: 'wait-h', class: 'label' }, `Чекають на вас · ${now.waiting.length}`),
+        el(
+          'ul',
+          { class: 'list card strong' },
+          now.waiting.map((w) => {
+            const head = w.task_title ? refTitle(w.task_ref, w.task_title) : w.last_prompt;
+            const what = reasonText(w.waiting_reason) || 'відповів, чекає на вас';
+            return el(
+              'li',
+              { class: 'sess' },
+              dot(w.project_id, w.project_color, 'hollow'),
+              el(
+                'button',
+                {
+                  type: 'button',
+                  class: 'sess-open',
+                  title: 'Підправити час або прибрати',
+                  disabled: !w.entry_id,
+                  onclick: () =>
+                    openEntryDialog({
+                      entryId: w.entry_id,
+                      startedAt: w.entry_started_at,
+                      stoppedAt: w.entry_stopped_at,
+                      projectId: w.project_id,
+                      projectName: w.project_name,
+                      color: w.project_color,
+                      sub: [head ? [head, ' — '] : null, what],
+                      sessionId: w.session_id,
+                      manual: false,
+                      waiting: true,
+                    }),
+                },
+                el('span', { class: 'name' }, w.project_name),
+                el('span', { class: 'sub' }, head ? [head, ' — '] : null, what),
+              ),
+              el('span', { class: 'tag' }, 'чекає'),
+              el('span', { class: 'big', 'data-wait': w.waiting_since }, waitText(serverNow() - w.waiting_since)),
+              el(
+                'button',
+                {
+                  type: 'button',
+                  class: 'btn icon ghost',
+                  'aria-label': `Прибрати сесію ${w.project_name} з очікування`,
+                  title: 'Сесію закінчено — прибрати. Новий промпт агенту поверне її.',
+                  onclick: () => stopSessionUi(w.session_id, 'Прибрано'),
+                },
+                icon('x'),
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+  }
+
+  // Працюють
+  const running = now.running;
+  frag.append(
+    el(
+      'section',
+      { class: 'section', 'aria-labelledby': 'run-h' },
+      el(now.waiting.length ? 'h2' : 'h1', { id: 'run-h', class: 'label' }, running.length ? `Працюють · ${running.length}` : 'Працюють'),
+      running.length
+        ? el(
+            'ul',
+            { class: 'list card' },
+            running.map((e) => {
+              const manual = e.source === 'manual';
+              const sub = e.task_title
+                ? refTitle(e.task_ref, e.task_title)
+                : [manual ? 'вручну' : 'без задачі', e.note ? ` · ${e.note}` : ''];
+              return el(
+                'li',
+                { class: 'sess' },
+                dot(e.project_id, e.project_color, 'live'),
+                el(
+                  'button',
+                  {
+                    type: 'button',
+                    class: 'sess-open',
+                    title: 'Зупинити або підправити час',
+                    onclick: () =>
+                      openEntryDialog({
+                        entryId: e.id,
+                        startedAt: e.started_at,
+                        stoppedAt: null,
+                        projectId: e.project_id,
+                        projectName: e.project_name,
+                        color: e.project_color,
+                        sub,
+                        sessionId: e.session_id,
+                        manual,
+                        waiting: false,
+                      }),
+                  },
+                  el('span', { class: 'name' }, e.project_name),
+                  el('span', { class: 'sub' }, sub),
+                ),
+                el(
+                  'button',
+                  {
+                    type: 'button',
+                    class: 'btn sm',
+                    title: manual ? 'Зупинити ручний таймер' : 'Зупинити облік цієї сесії агента до його наступного промпту',
+                    'aria-label': `Зупинити: ${e.project_name}`,
+                    onclick: () =>
+                      manual
+                        ? act(() => api(`/projects/${e.project_id}/stop`, { method: 'POST' }), 'Зупинено').then(refresh)
+                        : stopSessionUi(e.session_id, 'Сесію зупинено'),
+                  },
+                  icon('stop'),
+                  el('span', { class: 'hide-sm' }, 'Стоп'),
+                ),
+                el('span', { class: 'big', 'data-since': e.started_at }, hms(serverNow() - e.started_at)),
+              );
+            }),
+          )
+        : el(
+            'div',
+            { class: 'card empty' },
+            'Зараз ніхто не працює. Агент з’явиться тут, щойно отримає промпт; свою роботу запускайте кнопкою «+ Таймер».',
+          ),
+    ),
+  );
+
+  frag.append(todaySection(now.today));
+  return frag;
+}
+
+// Зупинити сесію агента (або прибрати з «Чекають на вас»). Агент не вимикається — лише облік;
+// новий промпт агенту знову почне рахувати час.
+function stopSessionUi(sessionId, ok) {
+  return act(() => api(`/sessions/${encodeURIComponent(sessionId)}/stop`, { method: 'POST' }), ok).then(refresh, () => {});
+}
+
+// ───────── діалог сесії: зупинити або підправити початок / кінець / тривалість
+
+const entryDialog = document.getElementById('entry-dialog');
+const entryForm = document.getElementById('entry-form');
+
+// Поля datetime-local порівнюємо як «умовний UTC»: важлива лише різниця, не пояс браузера.
+const fakeMs = (v) => (v ? Date.parse(`${v}:00Z`) : NaN);
+const fromFake = (ms) => new Date(ms).toISOString().slice(0, 16);
+function parseDur(v) {
+  const m = String(v).trim().match(/^(\d+)(?::(\d{1,2}))?(?::(\d{1,2}))?$/);
+  if (!m) return NaN;
+  if (m[2] === undefined) return Number(m[1]) * 60000; // «45» — хвилини
+  return (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3] ?? 0)) * 1000;
+}
+
+function openEntryDialog(x) {
+  const running = x.stoppedAt === null;
+  const start0 = localInput(x.startedAt);
+  const stop0 = running ? '' : localInput(x.stoppedAt);
+  const start = el('input', { type: 'datetime-local', name: 'start', required: true, value: start0 });
+  const stop = el('input', { type: 'datetime-local', name: 'stop', value: stop0 });
+  const dur = el('input', { name: 'duration', class: 'dur-input', inputmode: 'numeric', autocomplete: 'off', placeholder: 'Г:ХХ' });
+
+  let lastEdited = 'times';
+  const sync = (from) => {
+    lastEdited = from;
+    const a = fakeMs(start.value);
+    if (from === 'dur') {
+      const d = parseDur(dur.value);
+      if (Number.isFinite(a) && d > 0) stop.value = fromFake(a + d);
+      return;
+    }
+    const b = fakeMs(stop.value);
+    dur.value = Number.isFinite(a) && Number.isFinite(b) && b > a ? hm(b - a) : '';
+  };
+  start.addEventListener('input', () => sync('times'));
+  stop.addEventListener('input', () => sync('times'));
+  dur.addEventListener('input', () => sync('dur'));
+  sync('times');
+  if (running) dur.placeholder = `іде ${hm(serverNow() - x.startedAt)} — введіть, щоб зупинити`;
+
+  const stopNow = () =>
+    x.manual
+      ? act(() => api(`/projects/${x.projectId}/stop`, { method: 'POST' }), 'Зупинено')
+      : act(() => api(`/sessions/${encodeURIComponent(x.sessionId)}/stop`, { method: 'POST' }), x.waiting ? 'Прибрано' : 'Сесію зупинено');
+
+  entryForm.replaceChildren(
+    el(
+      'div',
+      { class: 'row between' },
+      el('div', { class: 'row', style: { gap: '10px', 'min-width': '0' } }, dot(x.projectId, x.color, running ? 'live' : ''), el('h2', { id: 'entry-dialog-h', class: 'ellipsis' }, x.projectName)),
+      el('button', { type: 'button', class: 'btn icon ghost', 'aria-label': 'Закрити', onclick: () => entryDialog.close() }, icon('x')),
+    ),
+    el('p', { class: 'live-note' }, x.sub),
+    running
+      ? el('div', { class: 'row between' }, el('span', { class: 'dur-big', 'data-since': x.startedAt }, hms(serverNow() - x.startedAt)), el('span', { class: 'badge' }, x.manual ? 'вручну · іде' : 'агент · іде'))
+      : null,
+    el('label', { class: 'field' }, 'Початок', start),
+    el('label', { class: 'field' }, running ? 'Кінець — порожньо, поки йде' : 'Кінець', stop),
+    el('label', { class: 'field' }, 'Тривалість', dur),
+    el(
+      'div',
+      { class: 'row wrap' },
+      el('button', { type: 'submit', class: 'btn primary sm' }, 'Зберегти'),
+      running || x.waiting
+        ? el('button', { type: 'button', class: 'btn sm', onclick: () => stopNow().then(() => { entryDialog.close(); refresh(); }, () => {}) }, icon(running ? 'stop' : 'x'), running ? 'Зупинити зараз' : 'Прибрати з очікування')
+        : null,
+      el('span', { style: { flex: '1' } }),
+      el('a', { href: '#entries', class: 'btn sm ghost', onclick: () => { state.entries.selected = x.entryId; entryDialog.close(); } }, 'У записах'),
+    ),
+    !x.manual && running ? el('p', { class: 'hint', style: { margin: '0' } }, 'Зупинка вимикає лише облік: агент працює далі, новий промпт знову запустить лічильник.') : null,
+  );
+
+  entryForm.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const body = {};
+    if (start.value !== start0) body.start = fromInput(start.value);
+    if (stop.value && stop.value !== stop0) body.stop = fromInput(stop.value);
+    // Задали лише тривалість — рахуємо кінець від точного початку (з секундами), а не від округленого до хвилини.
+    if (body.stop && !body.start && lastEdited === 'dur' && parseDur(dur.value) > 0) body.stop = x.startedAt + parseDur(dur.value);
+    if (!Object.keys(body).length) return entryDialog.close();
+    try {
+      await api(`/entries/${x.entryId}`, { method: 'PATCH', body });
+      // Агенту, якому задали кінець, не даємо самому відновити облік до нового промпту.
+      if (running && body.stop && !x.manual) await api(`/sessions/${encodeURIComponent(x.sessionId)}/stop`, { method: 'POST' }).catch(() => {});
+      toast(body.stop && running ? 'Зупинено' : 'Збережено');
+      entryDialog.close();
+      refresh();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+  entryDialog.showModal();
+  tick();
+}
+entryDialog.addEventListener('click', (ev) => {
+  if (ev.target === entryDialog) entryDialog.close();
+});
+
+function todaySection(t) {
+  const head = el(
+    'div',
+    { class: 'head' },
+    el('h2', { class: 'label' }, 'Сьогодні'),
+    el('span', { class: 'big-num' }, hm(t.wall_ms)),
+    t.sum_full_ms > t.wall_ms + 60000
+      ? el(
+          'span',
+          { class: 'label', style: { 'font-weight': '400' } },
+          'агенти разом ',
+          el('span', { class: 'mono' }, hm(t.sum_full_ms)),
+          ' · паралельно ',
+          el('span', { class: 'mono', style: { color: 'var(--accent)' } }, `×${t.parallelism.toFixed(2)}`),
+        )
+      : null,
+  );
+  if (!t.lanes.length) return el('section', { class: 'section' }, head, el('div', { class: 'card empty' }, 'Сьогодні ще нічого не записано.'));
+
+  const H = 3600_000;
+  const first = Math.min(...t.lanes.flatMap((l) => l.intervals.map((i) => i[0])));
+  let start = Math.floor(first / H) * H;
+  let end = Math.ceil(t.now / H) * H;
+  if (end - start < 4 * H) start = Math.max(t.from, end - 4 * H);
+  if (end <= start) end = start + 4 * H;
+  const span = end - start;
+  const pos = (ms) => `${(((ms - start) / span) * 100).toFixed(3)}%`;
+  const hours = span / H;
+  const step = hours > 12 ? 3 : hours > 7 ? 2 : 1;
+  const ticks = [];
+  for (let x = start; x <= end; x += step * H) ticks.push(x);
+
+  const card = el(
+    'div',
+    {
+      class: 'card pad lanes',
+      role: 'img',
+      'aria-label': `Шкала дня ${timeOf(start)}–${timeOf(end)}: ${t.lanes.map((l) => `${l.name} ${hm(l.total_ms)}`).join(', ')}`,
+    },
+    t.lanes.map((l) =>
+      el(
+        'div',
+        { class: 'lane' },
+        el('span', { class: 'n', title: l.name }, l.name),
+        el(
+          'span',
+          { class: 'track', style: { '--c': colorOf(l.project_id, l.color) } },
+          l.intervals.map(([s, e]) =>
+            el('span', { class: e === null ? 'live' : '', style: { left: pos(s), width: pos(start + ((e ?? t.now) - s)) } }),
+          ),
+          el('span', { class: 'nowline', style: { left: pos(t.now) } }),
+        ),
+        el('span', { class: 't' }, hm(l.total_ms)),
+      ),
+    ),
+    el(
+      'div',
+      { class: 'lane ticks', 'aria-hidden': 'true' },
+      el('span'),
+      el(
+        'span',
+        { class: 'scale' },
+        ticks.map((x) => el('span', { style: { left: pos(x) } }, hourOf(x))),
+      ),
+      el('span'),
+    ),
+  );
+  return el('section', { class: 'section', style: { gap: '12px' } }, head, card);
+}
+
+// ───────── Звіти
+
+async function viewReports() {
+  const { period, mode } = state.reports;
+  const [r] = await Promise.all([api(`/report?period=${period}&mode=${mode}`), state.projects.length ? null : loadProjects()]);
+  state.tz = r.timezone || state.tz;
+  const set = (patch) => {
+    Object.assign(state.reports, patch);
+    render();
+  };
+  const toolbar = el(
+    'div',
+    { class: 'toolbar' },
+    seg(PERIODS, period, (v) => set({ period: v }), 'Період'),
+    seg(MODES, mode, (v) => set({ mode: v }), 'Режим розподілу'),
+    el('span', { class: 'grow' }),
+    el('button', { type: 'button', class: 'btn sm', onclick: () => exportCsv(period) }, 'CSV'),
+  );
+
+  const tiles = el(
+    'div',
+    { class: 'tiles' },
+    tile(hm(r.wall_ms), 'Реальний час'),
+    tile(hm(r.sum_full_ms), 'Агенти разом'),
+    tile(`×${(r.parallelism || 0).toFixed(2)}`, 'Паралельність', true),
+    tile(hm(r.avg_daily_ms), `Середнє за день · ${r.days_with_entries} дн.`),
+  );
+
+  const parts = [toolbar, tiles];
+  if (r.days.length > 1) parts.push(daysChart(r.days));
+
+  const total = r.projects.reduce((a, p) => a + p.ms, 0);
+  const max = Math.max(1, ...r.projects.map((p) => p.ms));
+  parts.push(
+    el(
+      'section',
+      { class: 'section' },
+      el('div', { class: 'head' }, el('h2', { class: 'label' }, 'Проєкти'), el('span', { class: 'label', style: { 'font-weight': '400' } }, MODES.find((m) => m[0] === mode)[2])),
+      r.projects.length
+        ? el(
+            'div',
+            { class: 'card pad hbars' },
+            r.projects.map((p) =>
+              el(
+                'div',
+                { class: 'hbar' },
+                el('a', { class: 'n', href: `#projects/${encodeURIComponent(p.project_id)}`, style: { color: 'var(--ink)' } }, dot(p.project_id, p.color), el('span', { class: 'ellipsis' }, p.name)),
+                el('span', { class: 'track', style: { '--c': colorOf(p.project_id, p.color) } }, el('span', { style: { left: '0', width: `${(p.ms / max) * 100}%` } })),
+                el('span', { class: 'v' }, hm(p.ms)),
+                el('span', { class: 'p' }, total ? pct(p.ms / total) : '—'),
+              ),
+            ),
+          )
+        : el('div', { class: 'card empty' }, 'За цей період записів немає.'),
+    ),
+  );
+
+  if (r.tasks.length) {
+    parts.push(
+      el(
+        'section',
+        { class: 'section' },
+        el('h2', { class: 'label' }, 'Задачі'),
+        el(
+          'ul',
+          { class: 'list card' },
+          r.tasks.map((t) =>
+            el(
+              'li',
+              { class: 'sess', style: { padding: '12px 20px' } },
+              dot(t.project_id),
+              el(
+                'span',
+                { class: 'body' },
+                el('span', { class: 'ellipsis', style: { 'font-size': '14px' } }, t.status === 'done' ? '✓ ' : '', t.title),
+                el('span', { class: 'sub' }, t.project_name),
+              ),
+              el('span', { class: 'mono', style: { 'font-size': '14px', 'font-weight': '500' } }, hm(t.ms)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  if (r.running_included) parts.push(el('p', { class: 'hint', style: { margin: '0' } }, 'Запущені зараз записи пораховано до поточної хвилини.'));
+  return el('div', { class: 'stack', style: { gap: '24px' } }, parts);
+}
+
+function tile(v, k, accent = false) {
+  return el('div', { class: 'card tile' }, el('span', { class: `v${accent ? ' accent' : ''}` }, v), el('span', { class: 'k' }, k));
+}
+
+function daysChart(days) {
+  const max = Math.max(1, ...days.map((d) => Math.max(d.sum_full_ms, d.wall_ms)));
+  const many = days.length > 10;
+  const today = dayKey(serverNow());
+  return el(
+    'section',
+    { class: 'section' },
+    el(
+      'div',
+      { class: 'head' },
+      el('h2', { class: 'label' }, 'По днях'),
+      el('span', { class: 'legend' }, el('span', {}, el('i'), 'реальний час'), el('span', {}, el('i', { class: 'sum' }), 'агенти разом')),
+    ),
+    el(
+      'div',
+      { class: 'card pad chart' },
+      el(
+        'div',
+        { class: 'cols', role: 'img', 'aria-label': days.map((d) => `${d.date}: ${hm(d.wall_ms)} реального, ${hm(d.sum_full_ms)} разом`).join('; ') },
+        days.map((d) => {
+          const [y, m, dd] = d.date.split('-').map(Number);
+          const label = many
+            ? String(dd)
+            : new Intl.DateTimeFormat('uk-UA', { timeZone: 'UTC', weekday: 'short' }).format(Date.UTC(y, m - 1, dd));
+          return el(
+            'div',
+            { class: 'col', title: `${d.date} · реально ${hm(d.wall_ms)} · разом ${hm(d.sum_full_ms)}` },
+            el('span', { class: 'h' }, many || !d.wall_ms ? '' : hm(d.wall_ms)),
+            el(
+              'span',
+              { class: 'bars' },
+              el('span', { class: 'sum', style: { height: `${(d.sum_full_ms / max) * 100}%` } }),
+              el('span', { class: 'real', style: { height: `${(d.wall_ms / max) * 100}%` } }),
+            ),
+            el('span', { class: 'd', style: d.date === today ? { color: 'var(--ink)', 'font-weight': '500' } : {} }, label),
+          );
+        }),
+      ),
+    ),
+  );
+}
+
+async function exportCsv(period) {
+  const data = await act(() => api(`/entries?period=${period}`));
+  const esc = (v) => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\n;]/.test(s) || /^[=+\-@]/.test(s) ? `"${s.replace(/"/g, '""').replace(/^([=+\-@])/, "'$1")}"` : s;
+  };
+  const now = serverNow();
+  const rows = [['date', 'start', 'stop', 'duration_min', 'project', 'task', 'note', 'source']];
+  for (const e of [...data.entries].reverse()) {
+    const stop = e.stopped_at ?? now;
+    rows.push([
+      dayKey(e.started_at),
+      timeOf(e.started_at),
+      e.stopped_at ? timeOf(e.stopped_at) : '',
+      Math.round((stop - e.started_at) / 60000),
+      e.project_name,
+      e.task_title ?? '',
+      e.note ?? '',
+      e.source,
+    ]);
+  }
+  const blob = new Blob(['﻿' + rows.map((r) => r.map(esc).join(',')).join('\n')], { type: 'text/csv;charset=utf-8' });
+  const a = el('a', { href: URL.createObjectURL(blob), download: `timer-${period}-${dayKey(now)}.csv` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  if (data.truncated) toast('У CSV лише перші 1000 записів періоду', true);
+}
+
+// ───────── Записи
+
+async function viewEntries() {
+  const s = state.entries;
+  const [data] = await Promise.all([api(`/entries?period=${s.period}`), loadProjects()]);
+  s.data = data;
+  state.offset = data.now - Date.now();
+
+  const search = el('input', { type: 'search', placeholder: 'Пошук: проєкт, задача, нотатка', value: s.q, 'aria-label': 'Пошук записів', style: { 'max-width': '320px' } });
+  const listHost = el('div');
+  const panelHost = el('div');
+
+  const drawList = () => listHost.replaceChildren(entriesList(filtered()));
+  const drawPanel = () => panelHost.replaceChildren(entryPanel());
+  const filtered = () => {
+    const q = s.q.trim().toLocaleLowerCase('uk');
+    if (!q) return data.entries;
+    return data.entries.filter((e) => [e.project_name, e.task_title, e.note].some((x) => x && x.toLocaleLowerCase('uk').includes(q)));
+  };
+  search.addEventListener('input', () => {
+    s.q = search.value;
+    drawList();
+  });
+
+  const toolbar = el(
+    'div',
+    { class: 'toolbar' },
+    search,
+    seg(PERIODS.slice(0, 5), s.period, (v) => {
+      s.period = v;
+      s.selected = null;
+      render();
+    }, 'Період'),
+    el('span', { class: 'grow' }),
+    el('button', {
+      type: 'button',
+      class: 'btn sm',
+      onclick: () => {
+        s.selected = null;
+        s.creating = true;
+        drawList();
+        drawPanel();
+        panelHost.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      },
+    }, '+ Запис'),
+  );
+
+  const onSelect = (id) => {
+    s.selected = id;
+    s.creating = false;
+    drawList();
+    drawPanel();
+    if (matchMedia('(max-width: 860px)').matches) panelHost.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  };
+  state.entries.onSelect = onSelect;
+
+  drawList();
+  drawPanel();
+  return el('div', { class: 'stack', style: { gap: '20px' } }, toolbar, el('div', { class: 'split' }, listHost, panelHost));
+}
+
+function entriesList(entries) {
+  const s = state.entries;
+  if (!entries.length) return el('div', { class: 'card empty' }, s.q ? 'Нічого не знайдено.' : 'За цей період записів немає.');
+  const now = serverNow();
+  const groups = new Map();
+  for (const e of entries) {
+    const k = dayKey(e.started_at);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(e);
+  }
+  const items = [];
+  for (const [, list] of groups) {
+    const sum = list.reduce((a, e) => a + ((e.stopped_at ?? now) - e.started_at), 0);
+    items.push(el('li', { class: 'day-h' }, el('span', {}, dayTitle(list[0].started_at)), el('span', { class: 'mono' }, hm(sum))));
+    for (const e of list) {
+      const running = e.stopped_at === null;
+      const title = e.task_title || e.note || (e.source === 'manual' ? 'Ручний таймер' : 'Агент без задачі');
+      const sub = [e.project_name, e.task_title && e.note ? ` · ${e.note}` : '', e.source === 'claude_code' ? ' · агент' : ''];
+      items.push(
+        el(
+          'li',
+          {},
+          el(
+            'button',
+            { type: 'button', class: 'entry', 'aria-current': String(s.selected === e.id), onclick: () => s.onSelect(e.id) },
+            dot(e.project_id, e.project_color, running ? 'live' : ''),
+            el('span', { class: 'body' }, el('span', { class: 'name' }, e.task_ref ? `${e.task_ref} ` : '', title), el('span', { class: 'sub' }, sub)),
+            el('span', { class: 'when' }, `${timeOf(e.started_at)}–${running ? 'зараз' : timeOf(e.stopped_at)}`),
+            running
+              ? el('span', { class: 'dur', 'data-run': e.started_at, 'data-base': 0 }, hm(now - e.started_at))
+              : el('span', { class: 'dur' }, hm(e.stopped_at - e.started_at)),
+          ),
+        ),
+      );
+    }
+  }
+  if (s.data?.truncated) items.push(el('li', { class: 'more' }, 'Показано перші 1000 записів — звузьте період.'));
+  return el('ul', { class: 'list card', style: { overflow: 'hidden' } }, items);
+}
+
+function entryPanel() {
+  const s = state.entries;
+  const e = s.selected ? s.data.entries.find((x) => x.id === s.selected) : null;
+  if (!e && !s.creating) {
+    return el('div', { class: 'card panel' }, el('p', { class: 'hint', style: { margin: '0' } }, 'Оберіть запис, щоб змінити проєкт, задачу, нотатку чи час. Пропущений шматок роботи додайте через «+ Запис».'));
+  }
+  const now = serverNow();
+  const projects = state.projects.filter((p) => !p.archived_at || p.id === e?.project_id);
+  if (!projects.length) return el('div', { class: 'card panel' }, el('p', { class: 'hint' }, 'Спершу створіть проєкт на сторінці «Проєкти».'));
+
+  const project = el('select', { name: 'project' }, projects.map((p) => el('option', { value: p.id }, p.name)));
+  project.value = e?.project_id ?? projects[0].id;
+  const task = el('select', { name: 'task' });
+  const note = el('input', { name: 'note', value: e?.note ?? '', autocomplete: 'off', placeholder: 'Що робили' });
+  const start = el('input', { type: 'datetime-local', name: 'start', required: true, value: localInput(e?.started_at ?? now - 3600_000) });
+  const stop = el('input', { type: 'datetime-local', name: 'stop', value: e ? (e.stopped_at ? localInput(e.stopped_at) : '') : localInput(now) });
+  const dur = el('span', { class: 'dur-big' });
+
+  const fillTasks = async () => {
+    const list = await api(`/tasks?project_id=${encodeURIComponent(project.value)}&status=all`).catch(() => []);
+    const keep = e?.task_id && e.project_id === project.value ? e.task_id : '';
+    task.replaceChildren(
+      el('option', { value: '' }, '— без задачі —'),
+      ...list.filter((t) => t.status !== 'done' || t.id === keep).map((t) => el('option', { value: t.id }, `${t.external_ref ? `${t.external_ref} ` : ''}${t.title}`)),
+    );
+    task.value = keep;
+  };
+  project.addEventListener('change', fillTasks);
+  fillTasks();
+
+  // Тривалість рахуємо з рядків полів (час браузера не важливий — лише різниця).
+  const updDur = () => {
+    const a = Date.parse(`${start.value}:00Z`);
+    const b = stop.value ? Date.parse(`${stop.value}:00Z`) : NaN;
+    if (e && !e.stopped_at && !stop.value) {
+      dur.textContent = hms(serverNow() - e.started_at);
+      dur.dataset.since = e.started_at;
+    } else {
+      delete dur.dataset.since;
+      dur.textContent = Number.isFinite(a) && Number.isFinite(b) ? (b >= a ? hm(b - a) : '—') : '—';
+    }
+  };
+  start.addEventListener('input', updDur);
+  stop.addEventListener('input', updDur);
+  updDur();
+
+  const form = el(
+    'form',
+    { class: 'card panel', 'aria-label': e ? 'Редагування запису' : 'Новий запис' },
+    el('div', { class: 'row between' }, el('h3', {}, e ? 'Запис' : 'Новий запис'), e ? el('span', { class: 'badge' }, e.source === 'manual' ? 'вручну' : 'агент') : null),
+    dur,
+    el('label', { class: 'field' }, 'Проєкт', project),
+    el('label', { class: 'field' }, 'Задача', task),
+    el('label', { class: 'field' }, 'Нотатка', note),
+    el('label', { class: 'field' }, 'Початок', start),
+    el('label', { class: 'field' }, e && !e.stopped_at ? 'Кінець — іде зараз; вкажіть, щоб зупинити' : 'Кінець', stop),
+    el(
+      'div',
+      { class: 'row wrap' },
+      el('button', { type: 'submit', class: 'btn primary sm' }, e ? 'Зберегти' : 'Додати'),
+      e
+        ? el('button', {
+            type: 'button',
+            class: 'btn sm',
+            title: 'Запустити ручний таймер з тим самим проєктом, задачею й нотаткою',
+            onclick: () =>
+              act(() => api(`/projects/${e.project_id}/start`, { body: { note: e.note ?? undefined, task_id: e.task_id ?? undefined } }), 'Таймер запущено').then(() => (location.hash = '#now')),
+          }, 'Продовжити')
+        : el('button', { type: 'button', class: 'btn sm ghost', onclick: () => { s.creating = false; render(); } }, 'Скасувати'),
+      el('span', { class: 'grow', style: { flex: '1' } }),
+      e
+        ? confirmButton('Видалити', 'Точно видалити?', () =>
+            act(() => api(`/entries/${e.id}`, { method: 'DELETE' }), 'Запис видалено').then(() => {
+              s.selected = null;
+              render();
+            }),
+          )
+        : null,
+    ),
+  );
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const body = { project_id: project.value, task_id: task.value || null, note: note.value.trim() || null, start: fromInput(start.value) };
+    if (stop.value) body.stop = fromInput(stop.value);
+    if (e) {
+      await act(() => api(`/entries/${e.id}`, { method: 'PATCH', body }), 'Збережено');
+    } else {
+      if (!stop.value) return toast('Вкажіть кінець', true);
+      const created = await act(() => api('/entries', { body }), 'Запис додано');
+      s.selected = created.id;
+      s.creating = false;
+    }
+    render();
+  });
+  return form;
+}
+
+// ───────── Проєкти
+
+async function viewProjects(arg) {
+  const [, now, open] = await Promise.all([loadProjects(), api('/now'), api('/tasks?status=open')]);
+  state.now = now;
+  state.offset = now.now - Date.now();
+  const pv = state.projectsView;
+  const active = state.projects.filter((p) => !p.archived_at);
+  const archived = state.projects.filter((p) => p.archived_at);
+  const todayMs = Object.fromEntries(now.today.lanes.map((l) => [l.project_id, l.total_ms]));
+  const openCount = {};
+  for (const t of open) openCount[t.project_id] = (openCount[t.project_id] || 0) + 1;
+  const runningBy = {};
+  for (const e of now.running) runningBy[e.project_id] = [...(runningBy[e.project_id] || []), e];
+
+  const selected = projectById(arg) ?? active[0] ?? archived[0];
+
+  const link = (p) =>
+    el(
+      'a',
+      { href: `#projects/${encodeURIComponent(p.id)}`, 'aria-current': String(p.id === selected?.id), class: p.archived_at ? 'archived' : '' },
+      dot(p.id, p.color, runningBy[p.id] ? 'live' : ''),
+      el('span', { class: 'ellipsis' }, p.name),
+      el('span', { class: 'meta' }, todayMs[p.id] ? hm(todayMs[p.id]) : openCount[p.id] ? `${openCount[p.id]} задач` : ''),
+    );
+
+  const newName = el('input', { placeholder: 'Новий проєкт', 'aria-label': 'Назва нового проєкту', autocomplete: 'off', style: { height: '36px' } });
+  const newForm = el(
+    'form',
+    { class: 'row', style: { gap: '6px', padding: '6px' } },
+    newName,
+    el('button', { type: 'submit', class: 'btn sm' }, 'Додати'),
+  );
+  newForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if (!newName.value.trim()) return;
+    const p = await act(() => api('/projects', { body: { name: newName.value.trim() } }), 'Проєкт створено');
+    location.hash = `#projects/${encodeURIComponent(p.id)}`;
+  });
+
+  const side = el(
+    'nav',
+    { class: 'card plist', 'aria-label': 'Проєкти' },
+    active.map(link),
+    archived.length
+      ? el(
+          'button',
+          {
+            type: 'button',
+            class: 'btn sm ghost',
+            style: { 'justify-content': 'flex-start' },
+            onclick: () => {
+              pv.showArchived = !pv.showArchived;
+              render();
+            },
+          },
+          pv.showArchived ? 'Сховати архів' : `Архів · ${archived.length}`,
+        )
+      : null,
+    pv.showArchived ? archived.map(link) : null,
+    newForm,
+  );
+
+  if (!selected) {
+    return el(
+      'div',
+      { class: 'pgrid' },
+      side,
+      el('div', { class: 'card empty' }, 'Проєктів ще немає. Вони з’являються самі, коли агент отримує перший промпт у новій папці; для ручного обліку створіть проєкт ліворуч.'),
+    );
+  }
+  return el('div', { class: 'pgrid' }, side, await projectDetail(selected, todayMs[selected.id] || 0, runningBy[selected.id] || []));
+}
+
+async function projectDetail(p, today, running) {
+  const [tasks, week] = await Promise.all([
+    api(`/tasks?project_id=${encodeURIComponent(p.id)}&status=all`),
+    api(`/report?period=this_week&mode=full&project_id=${encodeURIComponent(p.id)}`),
+  ]);
+  const weekMs = week.projects.find((x) => x.project_id === p.id)?.ms ?? 0;
+  const now = serverNow();
+  const recentDone = (t) => t.status === 'done' && t.done_at && now - t.done_at < 7 * 86400_000;
+  const doing = tasks.filter((t) => t.status !== 'done' && (t.status === 'doing' || t.active_sessions > 0));
+  const todo = tasks.filter((t) => t.status === 'todo' && !t.active_sessions);
+  const done = tasks.filter(recentDone).sort((a, b) => b.done_at - a.done_at);
+  const agents = running.filter((e) => e.source === 'claude_code').length;
+  const manual = running.find((e) => e.source === 'manual');
+
+  // Заголовок
+  const title = el(
+    'div',
+    { class: 'title' },
+    dot(p.id, p.color, running.length ? 'live' : ''),
+    el('h1', {}, p.name),
+    agents ? el('span', { class: 'chip' }, `${agents} ${agents === 1 ? 'агент працює' : 'агенти працюють'}`) : null,
+    p.archived_at ? el('span', { class: 'chip' }, 'в архіві') : null,
+    el('span', { style: { flex: '1' } }),
+    manual
+      ? el('button', { type: 'button', class: 'btn sm', onclick: () => act(() => api(`/projects/${p.id}/stop`, { method: 'POST' }), 'Зупинено').then(refresh) }, icon('stop'), 'Стоп')
+      : el('button', { type: 'button', class: 'btn sm play', onclick: () => openTimer(p.id) }, icon('play'), 'Таймер'),
+  );
+
+  // Шляхи
+  const pathInput = el('input', { placeholder: '/Users/…/папка-проєкту', 'aria-label': 'Новий шлях', autocomplete: 'off', style: { height: '32px', 'font-family': 'var(--mono)', 'font-size': '12px' } });
+  const pathForm = el('form', { class: 'row', style: { gap: '6px' }, hidden: true }, pathInput, el('button', { type: 'submit', class: 'btn sm' }, 'Додати'));
+  pathForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if (!pathInput.value.trim()) return;
+    await act(() => api(`/projects/${p.id}/paths`, { body: { path: pathInput.value.trim() } }), 'Шлях додано');
+    refresh();
+  });
+  const paths = el(
+    'div',
+    { class: 'stack', style: { gap: '8px' } },
+    el(
+      'div',
+      { class: 'paths' },
+      p.paths.map((path) =>
+        el(
+          'span',
+          { class: 'path', title: path },
+          el('span', {}, path),
+          el('button', {
+            type: 'button',
+            'aria-label': `Відв’язати ${path}`,
+            onclick: () => act(() => api(`/projects/${p.id}/paths?path=${encodeURIComponent(path)}`, { method: 'DELETE' }), 'Шлях відв’язано').then(refresh),
+          }, '×'),
+        ),
+      ),
+      el('button', { type: 'button', class: 'btn sm ghost', style: { height: '26px' }, onclick: () => { pathForm.hidden = !pathForm.hidden; if (!pathForm.hidden) pathInput.focus(); } }, '+ шлях'),
+    ),
+    pathForm,
+    !p.paths.length ? el('p', { class: 'hint', style: { margin: '0' } }, 'Шляхів немає — агенти сюди час не пишуть, лише ручний таймер.') : null,
+  );
+
+  const stats = el(
+    'div',
+    { class: 'stats3' },
+    tile(hm(today), 'Сьогодні'),
+    tile(hm(weekMs), 'Тиждень'),
+    tile(String(doing.length + todo.length), 'Відкритих задач'),
+  );
+
+  // Нова задача
+  const taskInput = el('input', { placeholder: 'LIN-42: Що зробити', 'aria-label': 'Нова задача', autocomplete: 'off', name: 'task_title' });
+  const addForm = el('form', { class: 'addtask' }, taskInput, el('button', { type: 'submit', class: 'btn' }, 'Додати'));
+  addForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const raw = taskInput.value.trim();
+    if (!raw) return;
+    const m = raw.match(/^([A-Za-z][A-Za-z0-9]*-\d+)\s*[:\-—]?\s+(.+)$/);
+    const body = m ? { external_ref: m[1].toUpperCase(), title: m[2] } : { title: raw };
+    await act(() => api(`/projects/${p.id}/tasks`, { body }), 'Задачу додано');
+    refresh();
+  });
+
+  const group = (label, list, empty) =>
+    el(
+      'section',
+      { class: 'section' },
+      el('h2', { class: 'label' }, list.length ? `${label} · ${list.length}` : label),
+      list.length ? el('ul', { class: 'list card' }, list.map((t) => taskRow(p, t))) : empty ? el('div', { class: 'card empty' }, empty) : null,
+    );
+
+  // Ще дії: перейменувати, злити, архів
+  const rename = el('input', { value: p.name, 'aria-label': 'Нова назва', autocomplete: 'off', style: { height: '36px' } });
+  const renameForm = el('form', { class: 'row', style: { gap: '6px' } }, rename, el('button', { type: 'submit', class: 'btn sm' }, 'Перейменувати'));
+  renameForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if (rename.value.trim() && rename.value.trim() !== p.name) {
+      await act(() => api(`/projects/${p.id}`, { method: 'PATCH', body: { name: rename.value.trim() } }), 'Перейменовано');
+      refresh();
+    }
+  });
+  const others = state.projects.filter((x) => x.id !== p.id && !x.archived_at);
+  const mergeSel = el('select', { 'aria-label': 'Злити в проєкт', style: { height: '36px' } }, el('option', { value: '' }, 'Злити в…'), others.map((x) => el('option', { value: x.id }, x.name)));
+  const more = el(
+    'details',
+    { class: 'card pad' },
+    el('summary', { class: 'label', style: { cursor: 'pointer' } }, 'Налаштування проєкту'),
+    el(
+      'div',
+      { class: 'stack', style: { 'margin-top': '14px', gap: '12px' } },
+      renameForm,
+      others.length
+        ? el(
+            'div',
+            { class: 'row', style: { gap: '6px' } },
+            mergeSel,
+            confirmButton('Злити', 'Точно злити?', async () => {
+              if (!mergeSel.value) return toast('Оберіть проєкт', true);
+              const into = mergeSel.value;
+              await act(() => api(`/projects/${p.id}/merge`, { body: { into } }), 'Проєкти злито');
+              location.hash = `#projects/${encodeURIComponent(into)}`;
+            }, 'btn sm'),
+          )
+        : null,
+      el('p', { class: 'hint', style: { margin: '0' } }, 'Злиття переносить записи, задачі й шляхи в інший проєкт, а цей видаляє.'),
+      el('div', {}, el('button', {
+        type: 'button',
+        class: 'btn sm',
+        onclick: () => act(() => api(`/projects/${p.id}`, { method: 'PATCH', body: { archived: !p.archived_at } }), p.archived_at ? 'Повернуто з архіву' : 'В архіві').then(refresh),
+      }, p.archived_at ? 'Повернути з архіву' : 'В архів')),
+    ),
+  );
+
+  const mcp = el(
+    'div',
+    { class: 'card pad hint' },
+    el('b', {}, 'Задачі через MCP. '),
+    'Скажіть агенту в Claude Code «візьми задачу LIN-42» — він викличе ',
+    el('code', {}, 'timer_task_start'),
+    ', і час його сесії піде в задачу. Закінчив — ',
+    el('code', {}, 'timer_task_done'),
+    '. Нові задачі агент додає через ',
+    el('code', {}, 'timer_task_add'),
+    '.',
+  );
+
+  return el(
+    'div',
+    { class: 'detail' },
+    title,
+    paths,
+    stats,
+    addForm,
+    group('В роботі', doing, null),
+    group('До роботи', todo, doing.length ? null : 'Відкритих задач немає.'),
+    done.length ? group('Готово за 7 днів', done, null) : null,
+    mcp,
+    more,
+  );
+}
+
+function taskRow(p, t) {
+  const isDone = t.status === 'done';
+  const box = el('input', { type: 'checkbox', 'aria-label': isDone ? `Повернути «${t.title}» в роботу` : `Позначити «${t.title}» виконаною`, checked: isDone });
+  box.addEventListener('change', () =>
+    act(() => api(`/tasks/${t.id}`, { method: 'PATCH', body: { status: isDone ? 'todo' : 'done' } }), isDone ? 'Повернуто' : 'Готово').then(refresh, refresh),
+  );
+  return el(
+    'li',
+    { class: `task${isDone ? ' done' : ''}` },
+    box,
+    el(
+      'span',
+      { class: 't' },
+      el('span', { class: 'ttl', title: t.title }, t.external_ref ? el('span', { class: 'mono' }, t.external_ref) : null, t.title),
+      t.active_sessions
+        ? el('span', { class: 'sub' }, el('span', { class: 'chip', style: { height: '18px', 'margin-top': '3px' } }, dot(p.id, p.color, 'live'), t.active_sessions === 1 ? 'зараз працює' : `${t.active_sessions} сесії працюють`))
+        : t.notes
+          ? el('span', { class: 'sub ellipsis' }, t.notes)
+          : null,
+    ),
+    el('span', { class: 'spent', title: 'Усього часу на задачу' }, t.spent_ms ? hm(t.spent_ms) : ''),
+    el(
+      'span',
+      { class: 'acts' },
+      !isDone && !p.archived_at
+        ? el('button', {
+            type: 'button',
+            class: 'btn icon ghost play',
+            'aria-label': `Таймер на «${t.title}»`,
+            title: 'Ручний таймер на цю задачу',
+            onclick: () => act(() => api(`/projects/${p.id}/switch`, { body: { task_id: t.id } }), 'Таймер запущено').then(refresh),
+          }, icon('play'))
+        : null,
+      iconConfirm('x', `Видалити «${t.title}»`, () => act(() => api(`/tasks/${t.id}`, { method: 'DELETE' }), 'Задачу видалено').then(refresh)),
+    ),
+  );
+}
+
+// ───────── діалог «+ Таймер»
+
+const dialog = document.getElementById('timer-dialog');
+const tform = document.getElementById('timer-form');
+const NEW = '__new__';
+
+async function openTimer(projectId) {
+  try {
+    await loadProjects();
+  } catch (e) {
+    return toast(e.message, true);
+  }
+  const sel = tform.elements.project;
+  const active = state.projects.filter((p) => !p.archived_at);
+  sel.replaceChildren(...active.map((p) => el('option', { value: p.id }, p.name)), el('option', { value: NEW }, '+ Новий проєкт…'));
+  sel.value = projectId && active.some((p) => p.id === projectId) ? projectId : active[0]?.id ?? NEW;
+  tform.elements.note.value = '';
+  tform.elements.new_project.value = '';
+  await onProjectChange();
+  dialog.showModal();
+}
+
+async function onProjectChange() {
+  const v = tform.elements.project.value;
+  tform.querySelector('[data-new-project]').hidden = v !== NEW;
+  tform.elements.new_project.required = v === NEW;
+  const task = tform.elements.task;
+  task.replaceChildren(el('option', { value: '' }, '— без задачі —'));
+  if (v && v !== NEW) {
+    const list = await api(`/tasks?project_id=${encodeURIComponent(v)}&status=open`).catch(() => []);
+    task.append(...list.map((t) => el('option', { value: t.id }, `${t.external_ref ? `${t.external_ref} ` : ''}${t.title}`)));
+  }
+}
+tform.elements.project.addEventListener('change', onProjectChange);
+
+tform.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const f = tform.elements;
+  try {
+    let pid = f.project.value;
+    if (pid === NEW) {
+      const name = f.new_project.value.trim();
+      if (!name) return;
+      pid = (await api('/projects', { body: { name } })).id;
+    }
+    const body = { note: f.note.value.trim() || undefined, task_id: f.task.value || undefined };
+    await api(`/projects/${pid}/${f.switch.checked ? 'switch' : 'start'}`, { body });
+    dialog.close();
+    toast('Таймер запущено');
+    if (route().name === 'now') refresh();
+    else location.hash = '#now';
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+document.addEventListener('click', (ev) => {
+  const a = ev.target.closest('[data-action]');
+  if (!a) return;
+  if (a.dataset.action === 'new-timer') {
+    const r = route();
+    openTimer(r.name === 'projects' ? r.arg : undefined);
+  }
+  if (a.dataset.action === 'close-dialog') dialog.close();
+});
+dialog.addEventListener('click', (ev) => {
+  if (ev.target === dialog) dialog.close();
+});
+
+// ───────── старт
+
+const VIEWS = { now: viewNow, reports: viewReports, entries: viewEntries, projects: viewProjects };
+window.addEventListener('hashchange', () => {
+  render();
+  view.focus({ preventScroll: true });
+  window.scrollTo(0, 0);
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && route().name === 'now') refresh();
+});
+// Хто увійшов — підказка на «Вийти» (ендпоінт Access, без API трекера).
+fetch('/cdn-cgi/access/get-identity', { credentials: 'same-origin' })
+  .then((r) => (r.ok ? r.json() : null))
+  .then((id) => {
+    if (id?.email) document.querySelector('.logout').title = `Ви увійшли як ${id.email}. Вийти`;
+  })
+  .catch(() => {});
+
+api('/config')
+  .then((c) => (state.tz = c.timezone || state.tz))
+  .catch(() => {})
+  .finally(render);
