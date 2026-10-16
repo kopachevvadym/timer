@@ -12,13 +12,14 @@ SESSION="${CHAT_SESSION_ID:?CHAT_SESSION_ID: унікальна назва ча�
 DIR="${CHAT_PROJECT_DIR:-/Users/home/Business/Own/timer}"
 BASE="${TIMER_BASE:-https://timer.kopachev.life}"
 SETTINGS="$HOME/.claude/settings.json"
-ID="$(node -p "require('$SETTINGS').env.TIMER_CF_ID")"
-SEC="$(node -p "require('$SETTINGS').env.TIMER_CF_SECRET")"
+# Ключ «лише хуки» з ~/.claude/settings.json (його кладе install-hooks.mjs).
+KEY="${TIMER_API_KEY:-$(node -p "require('$SETTINGS').env?.TIMER_API_KEY ?? ''")}"
+[ -n "$KEY" ] || { echo "Немає TIMER_API_KEY у $SETTINGS — запустіть install-hooks.mjs" >&2; exit 1; }
 BODY="$(EVENT="$EVENT" SESSION="$SESSION" DIR="$DIR" PROMPT="$PROMPT" node -e '
   const b = { hook_event_name: process.env.EVENT, session_id: process.env.SESSION, cwd: process.env.DIR };
   if (process.env.PROMPT) b.prompt = process.env.PROMPT;
   process.stdout.write(JSON.stringify(b));')"
 curl -sS -o /dev/null -w "%{http_code}\n" -X POST "$BASE/hooks/claude" \
   -H "content-type: application/json" -H "X-Project-Dir: $DIR" \
-  -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SEC" \
+  -H "Authorization: Bearer $KEY" \
   -d "$BODY"

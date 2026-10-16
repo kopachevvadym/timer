@@ -43,10 +43,11 @@ async function api(path, opts = {}) {
       redirect: 'manual',
     });
   } catch {
-    throw new AuthError('Немає зв’язку із сервером або сесія Cloudflare Access закінчилась — оновіть сторінку');
+    throw new Error('Немає зв’язку із сервером — перевірте інтернет і оновіть сторінку');
   }
   if (res.type === 'opaqueredirect' || res.status === 401) {
-    throw new AuthError('Сесія Cloudflare Access закінчилась — оновіть сторінку');
+    showLanding();
+    throw new AuthError('Сесія закінчилась — увійдіть знову');
   }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
@@ -240,10 +241,11 @@ let pollTimer = null;
 
 function route() {
   const [name = 'now', arg] = location.hash.replace(/^#/, '').split('/');
-  return { name: ['now', 'reports', 'entries', 'projects'].includes(name) ? name : 'now', arg: arg ? decodeURIComponent(arg) : null };
+  return { name: ['now', 'reports', 'entries', 'projects', 'settings'].includes(name) ? name : 'now', arg: arg ? decodeURIComponent(arg) : null };
 }
 
 async function render() {
+  if (!state.me) return;
   const seq = ++renderSeq;
   const r = route();
   for (const a of document.querySelectorAll('[data-route]')) {
@@ -256,10 +258,10 @@ async function render() {
     const node = await VIEWS[r.name](r.arg);
     if (seq !== renderSeq) return;
     view.replaceChildren(node);
-    document.title = `${{ now: 'Зараз', reports: 'Звіти', entries: 'Записи', projects: 'Проєкти' }[r.name]} · Timer`;
+    document.title = `${{ now: 'Зараз', reports: 'Звіти', entries: 'Записи', projects: 'Проєкти', settings: 'Налаштування' }[r.name]} · Timer`;
     tick();
   } catch (e) {
-    if (seq !== renderSeq) return;
+    if (seq !== renderSeq || e instanceof AuthError) return;
     view.replaceChildren(el('div', { class: 'card empty' }, e.message));
   }
   if (r.name === 'now') pollTimer = setInterval(() => !document.hidden && refresh(), 15000);
@@ -299,61 +301,12 @@ async function viewNow() {
         'section',
         { class: 'section', 'aria-labelledby': 'wait-h' },
         el('h1', { id: 'wait-h', class: 'label' }, `Чекають на вас · ${now.waiting.length}`),
-        el(
-          'ul',
-          { class: 'list card strong' },
-          now.waiting.map((w) => {
-            const head = w.task_title ? refTitle(w.task_ref, w.task_title) : w.last_prompt;
-            const what = reasonText(w.waiting_reason) || 'відповів, чекає на вас';
-            return el(
-              'li',
-              { class: 'sess' },
-              dot(w.project_id, w.project_color, 'hollow'),
-              el(
-                'button',
-                {
-                  type: 'button',
-                  class: 'sess-open',
-                  title: 'Підправити час або прибрати',
-                  disabled: !w.entry_id,
-                  onclick: () =>
-                    openEntryDialog({
-                      entryId: w.entry_id,
-                      startedAt: w.entry_started_at,
-                      stoppedAt: w.entry_stopped_at,
-                      projectId: w.project_id,
-                      projectName: w.project_name,
-                      color: w.project_color,
-                      sub: [head ? [head, ' — '] : null, what],
-                      sessionId: w.session_id,
-                      manual: false,
-                      waiting: true,
-                    }),
-                },
-                el('span', { class: 'name' }, w.project_name),
-                el('span', { class: 'sub' }, head ? [head, ' — '] : null, what),
-              ),
-              el('span', { class: 'tag' }, 'чекає'),
-              el('span', { class: 'big', 'data-wait': w.waiting_since }, waitText(serverNow() - w.waiting_since)),
-              el(
-                'button',
-                {
-                  type: 'button',
-                  class: 'btn icon ghost',
-                  'aria-label': `Прибрати сесію ${w.project_name} з очікування`,
-                  title: 'Сесію закінчено — прибрати. Новий промпт агенту поверне її.',
-                  onclick: () => stopSessionUi(w.session_id, 'Прибрано'),
-                },
-                icon('x'),
-              ),
-            );
-          }),
-        ),
+        el('ul', { class: 'list card strong' }, groupByProject(now.waiting).map((g) => projectGroup(g, waitRow, 'hollow', (w) => w.waiting_since, waitText))),
       ),
     );
   }
 
-  // Працюють
+  // Працюють — кілька сесій/задач одного проєкту показуються під одним проєктом.
   const running = now.running;
   frag.append(
     el(
@@ -361,60 +314,7 @@ async function viewNow() {
       { class: 'section', 'aria-labelledby': 'run-h' },
       el(now.waiting.length ? 'h2' : 'h1', { id: 'run-h', class: 'label' }, running.length ? `Працюють · ${running.length}` : 'Працюють'),
       running.length
-        ? el(
-            'ul',
-            { class: 'list card' },
-            running.map((e) => {
-              const manual = e.source === 'manual';
-              const sub = e.task_title
-                ? refTitle(e.task_ref, e.task_title)
-                : [manual ? 'вручну' : 'без задачі', e.note ? ` · ${e.note}` : ''];
-              return el(
-                'li',
-                { class: 'sess' },
-                dot(e.project_id, e.project_color, 'live'),
-                el(
-                  'button',
-                  {
-                    type: 'button',
-                    class: 'sess-open',
-                    title: 'Зупинити або підправити час',
-                    onclick: () =>
-                      openEntryDialog({
-                        entryId: e.id,
-                        startedAt: e.started_at,
-                        stoppedAt: null,
-                        projectId: e.project_id,
-                        projectName: e.project_name,
-                        color: e.project_color,
-                        sub,
-                        sessionId: e.session_id,
-                        manual,
-                        waiting: false,
-                      }),
-                  },
-                  el('span', { class: 'name' }, e.project_name),
-                  el('span', { class: 'sub' }, sub),
-                ),
-                el(
-                  'button',
-                  {
-                    type: 'button',
-                    class: 'btn sm',
-                    title: manual ? 'Зупинити ручний таймер' : 'Зупинити облік цієї сесії агента до його наступного промпту',
-                    'aria-label': `Зупинити: ${e.project_name}`,
-                    onclick: () =>
-                      manual
-                        ? act(() => api(`/projects/${e.project_id}/stop`, { method: 'POST' }), 'Зупинено').then(refresh)
-                        : stopSessionUi(e.session_id, 'Сесію зупинено'),
-                  },
-                  icon('stop'),
-                  el('span', { class: 'hide-sm' }, 'Стоп'),
-                ),
-                el('span', { class: 'big', 'data-since': e.started_at }, hms(serverNow() - e.started_at)),
-              );
-            }),
-          )
+        ? el('ul', { class: 'list card' }, groupByProject(running).map((g) => projectGroup(g, runRow, 'live', (e) => e.started_at, hms)))
         : el(
             'div',
             { class: 'card empty' },
@@ -425,6 +325,145 @@ async function viewNow() {
 
   frag.append(todaySection(now.today));
   return frag;
+}
+
+// [{project_id, project_name, project_color, items: [...]}] у порядку першої появи.
+function groupByProject(list) {
+  const groups = new Map();
+  for (const x of list) {
+    if (!groups.has(x.project_id)) groups.set(x.project_id, { project_id: x.project_id, project_name: x.project_name, project_color: x.project_color, items: [] });
+    groups.get(x.project_id).items.push(x);
+  }
+  return [...groups.values()];
+}
+
+// Один елемент — звичайний рядок; кілька — заголовок проєкту і вкладені рядки задач/сесій.
+// since(x) — від якого моменту рахувати; fmt — як показати тривалість.
+function projectGroup(g, row, dotKind, since, fmt) {
+  if (g.items.length === 1) return row(g.items[0], false);
+  const from = Math.min(...g.items.map(since));
+  const attr = dotKind === 'live' ? 'data-since' : 'data-wait';
+  const counts = g.items.length;
+  return el(
+    'li',
+    { class: 'pgroup' },
+    el(
+      'div',
+      { class: 'sess pgroup-head' },
+      dot(g.project_id, g.project_color, dotKind),
+      el('span', { class: 'body' }, el('span', { class: 'name' }, g.project_name), el('span', { class: 'sub' }, `${counts} ${plural(counts, 'паралельна сесія', 'паралельні сесії', 'паралельних сесій')}`)),
+      el('span', { class: 'big', [attr]: from, title: 'Від найранішого початку' }, fmt(serverNow() - from)),
+    ),
+    el('ul', { class: 'list nested' }, g.items.map((x) => row(x, true))),
+  );
+}
+
+function plural(n, one, few, many) {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
+}
+
+function runRow(e, nested) {
+  const manual = e.source === 'manual';
+  const sub = e.task_title ? refTitle(e.task_ref, e.task_title) : [manual ? 'вручну' : 'без задачі', e.note ? ` · ${e.note}` : ''];
+  // У групі назва проєкту вже в заголовку: рядок називаємо задачею, а нотатку — підписом.
+  const title = nested ? (e.task_title ? refTitle(e.task_ref, e.task_title) : manual ? 'Вручну' : 'Без задачі') : e.project_name;
+  const viaMcp = /^[^:]+:mcp:/.test(e.session_id);
+  const subLine = nested ? [manual ? 'вручну' : viaMcp ? 'задача через MCP' : 'агент', e.note ? ` · ${e.note}` : ''] : sub;
+  return el(
+    'li',
+    { class: 'sess' },
+    nested ? null : dot(e.project_id, e.project_color, 'live'),
+    el(
+      'button',
+      {
+        type: 'button',
+        class: 'sess-open',
+        title: 'Зупинити або підправити час',
+        onclick: () =>
+          openEntryDialog({
+            entryId: e.id,
+            startedAt: e.started_at,
+            stoppedAt: null,
+            projectId: e.project_id,
+            projectName: e.project_name,
+            color: e.project_color,
+            sub,
+            sessionId: e.session_id,
+            manual,
+            waiting: false,
+          }),
+      },
+      el('span', { class: 'name' }, title),
+      el('span', { class: 'sub' }, subLine),
+    ),
+    el(
+      'button',
+      {
+        type: 'button',
+        class: 'btn sm',
+        title: manual ? 'Зупинити ручний таймер' : 'Зупинити облік цієї сесії агента до його наступного промпту',
+        'aria-label': `Зупинити: ${e.project_name}${e.task_title ? ` · ${e.task_title}` : ''}`,
+        onclick: () =>
+          manual ? act(() => api(`/projects/${e.project_id}/stop`, { method: 'POST' }), 'Зупинено').then(refresh) : stopSessionUi(e.session_id, 'Сесію зупинено'),
+      },
+      icon('stop'),
+      el('span', { class: 'hide-sm' }, 'Стоп'),
+    ),
+    el('span', { class: 'big', 'data-since': e.started_at }, hms(serverNow() - e.started_at)),
+  );
+}
+
+function waitRow(w, nested) {
+  const head = w.task_title ? refTitle(w.task_ref, w.task_title) : w.last_prompt;
+  const what = reasonText(w.waiting_reason) || 'відповів, чекає на вас';
+  const title = nested ? (w.task_title ? refTitle(w.task_ref, w.task_title) : w.last_prompt || 'Без задачі') : w.project_name;
+  const subLine = nested ? what : [head ? [head, ' — '] : null, what];
+  return el(
+    'li',
+    { class: 'sess' },
+    nested ? null : dot(w.project_id, w.project_color, 'hollow'),
+    el(
+      'button',
+      {
+        type: 'button',
+        class: 'sess-open',
+        title: 'Підправити час або прибрати',
+        disabled: !w.entry_id,
+        onclick: () =>
+          openEntryDialog({
+            entryId: w.entry_id,
+            startedAt: w.entry_started_at,
+            stoppedAt: w.entry_stopped_at,
+            projectId: w.project_id,
+            projectName: w.project_name,
+            color: w.project_color,
+            sub: [head ? [head, ' — '] : null, what],
+            sessionId: w.session_id,
+            manual: false,
+            waiting: true,
+          }),
+      },
+      el('span', { class: 'name' }, title),
+      el('span', { class: 'sub' }, subLine),
+    ),
+    el('span', { class: 'tag' }, 'чекає'),
+    el('span', { class: 'big', 'data-wait': w.waiting_since }, waitText(serverNow() - w.waiting_since)),
+    el(
+      'button',
+      {
+        type: 'button',
+        class: 'btn icon ghost',
+        'aria-label': `Прибрати сесію ${w.project_name} з очікування`,
+        title: 'Сесію закінчено — прибрати. Новий промпт агенту поверне її.',
+        onclick: () => stopSessionUi(w.session_id, 'Прибрано'),
+      },
+      icon('x'),
+    ),
+  );
 }
 
 // Зупинити сесію агента (або прибрати з «Чекають на вас»). Агент не вимикається — лише облік;
@@ -1305,10 +1344,320 @@ dialog.addEventListener('click', (ev) => {
   if (ev.target === dialog) dialog.close();
 });
 
+// ───────── акаунт: лендінг, налаштування, підключення
+
+const browserTz = () => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+};
+const loginUrl = () => `/auth/github?tz=${encodeURIComponent(browserTz())}&next=${encodeURIComponent('/' + location.hash)}`;
+
+function setMe(me) {
+  state.me = me;
+  state.tz = me.user.timezone || state.tz;
+  document.body.classList.remove('anon');
+  const a = document.querySelector('.me');
+  a.hidden = false;
+  const img = a.querySelector('img');
+  if (img && me.user.avatar_url) img.src = me.user.avatar_url;
+  else img?.remove();
+  a.querySelector('span').textContent = me.user.login || 'Акаунт';
+}
+
+function showLanding() {
+  if (document.body.classList.contains('anon')) return;
+  state.me = null;
+  clearInterval(pollTimer);
+  document.body.classList.add('anon');
+  document.title = 'Timer — трекер часу AI-агентів';
+  view.replaceChildren(
+    el(
+      'div',
+      { class: 'landing' },
+      el('h1', {}, 'Скільки насправді працюють ваші AI-агенти?'),
+      el(
+        'p',
+        { class: 'lead' },
+        'Кілька Claude Code у різних репозиторіях одночасно. Timer сам рахує час кожного агента, показує, хто чекає на вашу відповідь, і чесно ділить паралельні години між проєктами.',
+      ),
+      el('div', { class: 'row wrap' }, el('a', { class: 'btn primary lg', href: loginUrl() }, githubIcon(), 'Увійти через GitHub')),
+      el('img', { class: 'shot', src: '/screenshot.png', alt: 'Екран «Зараз»: агенти, що чекають і працюють, шкала дня', loading: 'lazy' }),
+      el(
+        'ul',
+        { class: 'features' },
+        el('li', {}, el('b', {}, 'Без кнопок. '), 'Хуки Claude Code вмикають облік на промпті й вимикають, коли агент закінчив.'),
+        el('li', {}, el('b', {}, 'Задачі через MCP. '), '«Візьми LIN-42» — і час сесії йде в задачу. Працює в Claude Code, claude.ai і Claude Desktop.'),
+        el('li', {}, el('b', {}, 'Чекають на вас. '), 'Видно, який агент простоює через вас і скільки хвилин.'),
+        el('li', {}, el('b', {}, 'Ваші дані — лише ваші. '), 'Інші користувачі їх не бачать; промпти не зберігаються, доки ви самі не ввімкнете.'),
+      ),
+      el('p', { class: 'hint' }, 'Відкритий код: ', el('a', { href: 'https://github.com/kopachevvadym/timer', rel: 'noopener' }, 'github.com/kopachevvadym/timer')),
+    ),
+  );
+}
+
+function githubIcon() {
+  const t = document.createElement('template');
+  t.innerHTML =
+    '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
+  return t.content.firstChild;
+}
+
+// resolve(): справжній текст для буфера (напр. команда зі щойно створеним ключем); без нього копіюється text.
+function codeBlock(text, label, resolve) {
+  const pre = el('code', {}, text);
+  return el(
+    'div',
+    { class: 'code' },
+    pre,
+    el(
+      'button',
+      {
+        type: 'button',
+        class: 'btn sm',
+        'aria-label': `Скопіювати: ${label}`,
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          const value = resolve ? resolve() : Promise.resolve(text);
+          try {
+            // ClipboardItem з промісом зберігає «жест користувача» поки чекаємо на сервер (Safari інакше відмовляє).
+            if (resolve && window.ClipboardItem && navigator.clipboard?.write) {
+              await navigator.clipboard.write([new ClipboardItem({ 'text/plain': value.then((t) => new Blob([t], { type: 'text/plain' })) })]);
+            } else {
+              await navigator.clipboard.writeText(await value);
+            }
+            btn.textContent = 'Скопійовано';
+            if (resolve) toast('Скопійовано з ключем — виконайте в терміналі');
+          } catch {
+            if (resolve) {
+              const t = await value.catch(() => null);
+              if (!t) return;
+              pre.textContent = t;
+            }
+            const r = document.createRange();
+            r.selectNodeContents(pre);
+            getSelection().removeAllRanges();
+            getSelection().addRange(r);
+          }
+        },
+      },
+      'Копіювати',
+    ),
+  );
+}
+
+async function viewSettings() {
+  const me = await api('/me');
+  setMe(me);
+  const base = location.origin;
+  // MCP входить через GitHub (OAuth) — ключ йому не потрібен. Ключ «лише хуки» лежить у env агента
+  // і відкриває тільки /hooks. Повний ключ — для MCP-клієнтів без OAuth (розділ «Інші клієнти»).
+  const fresh = !!state.newKey?.hooks;
+  const hooksKey = state.newKey?.hooks ?? 'tk_КЛЮЧ';
+  const setupCmd = (key) => `curl -fsSL ${base}/install-hooks.mjs | node --input-type=module - ${base} ${key}`;
+  const headerCmd = (key) => `claude mcp add --transport http timer --scope user ${base}/mcp --header "Authorization: Bearer ${key}"`;
+
+  const keyList = me.keys.length
+    ? el(
+        'ul',
+        { class: 'list card' },
+        me.keys.map((k) =>
+          el(
+            'li',
+            { class: 'sess', style: { padding: '12px 20px' } },
+            el(
+              'span',
+              { class: 'body' },
+              el(
+                'span',
+                { class: 'name', style: { 'font-weight': '500' } },
+                k.name,
+                ' ',
+                el('span', { class: 'badge' }, k.scope === 'hooks' ? 'лише хуки' : 'повний'),
+                ' ',
+                el('span', { class: 'mono muted' }, `${k.prefix}…`),
+              ),
+              el(
+                'span',
+                { class: 'sub' },
+                `створено ${dayTitle(k.created_at)}`,
+                k.last_used_at ? ` · востаннє ${dayTitle(k.last_used_at)}, ${timeOf(k.last_used_at)}` : ' · ще не використовувався',
+              ),
+            ),
+            confirmButton('Відкликати', 'Точно відкликати?', () =>
+              act(() => api(`/keys/${k.id}`, { method: 'DELETE' }), 'Ключ відкликано').then(() => {
+                state.newKey = null;
+                render();
+              }),
+            ),
+          ),
+        ),
+      )
+    : el('div', { class: 'card empty' }, 'Ключів ще немає — «Копіювати» в кроці 2 створить ключ сам.');
+
+  const keyName = el('input', { placeholder: 'напр. MacBook', 'aria-label': 'Назва комп’ютера', autocomplete: 'off', style: { 'max-width': '260px' } });
+  // Сервер зберігає лише хеш ключа, тож показати старий ключ неможливо: «Копіювати» створює новий
+  // (один на відвідування сторінки) і підставляє його в команду.
+  let pending = null;
+  const ensureHooksKey = () => {
+    if (state.newKey?.hooks) return Promise.resolve(state.newKey.hooks);
+    pending ??= act(() => api('/keys', { body: { name: keyName.value.trim() || 'Claude Code', scope: 'hooks' } }))
+      .then((k) => {
+        state.newKey = { ...state.newKey, hooks: k.key };
+        setTimeout(render, 0); // показати підставлений ключ і попередження
+        return k.key;
+      })
+      .finally(() => {
+        pending = null;
+      });
+    return pending;
+  };
+  const fullKeyOut = el('div', { class: 'stack', style: { gap: '8px' } });
+  if (state.newKey?.full) fullKeyOut.append(codeBlock(headerCmd(state.newKey.full), 'команду MCP з ключем'));
+  const fullKeyBtn = el(
+    'button',
+    {
+      type: 'button',
+      class: 'btn sm',
+      onclick: async () => {
+        const k = await act(() => api('/keys', { body: { name: `${keyName.value.trim() || 'Клієнт без OAuth'} · MCP`, scope: 'full' } }));
+        state.newKey = { ...state.newKey, full: k.key };
+        fullKeyOut.replaceChildren(
+          el('p', { class: 'hint warn-box', style: { margin: '0' } }, 'Повний ключ відкриває всі ваші дані. Скопіюйте зараз — потім його не буде видно.'),
+          codeBlock(headerCmd(k.key), 'команду MCP з ключем'),
+        );
+      },
+    },
+    'Створити повний ключ',
+  );
+
+  const tzInput = el('input', { value: me.user.timezone, list: 'tz-list', 'aria-label': 'Часовий пояс', autocomplete: 'off', style: { 'max-width': '260px' } });
+  let zones = [];
+  try {
+    zones = Intl.supportedValuesOf('timeZone');
+  } catch {}
+  const noteBox = el('input', { type: 'checkbox', checked: me.user.note_from_prompt });
+  const prefs = el(
+    'form',
+    { class: 'card pad stack' },
+    el('label', { class: 'field' }, 'Часовий пояс (межі днів у звітах)', tzInput, el('datalist', { id: 'tz-list' }, zones.map((z) => el('option', { value: z })))),
+    el('label', { class: 'check' }, noteBox, 'Зберігати початок промпту як нотатку запису (до 140 символів)'),
+    el('p', { class: 'hint', style: { margin: '0' } }, 'Промпти можуть містити приватне; без цієї галочки трекер бачить лише назви папок і задач.'),
+    el('div', {}, el('button', { type: 'submit', class: 'btn sm' }, 'Зберегти')),
+  );
+  prefs.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    await act(() => api('/me', { method: 'PATCH', body: { timezone: tzInput.value.trim(), note_from_prompt: noteBox.checked } }), 'Збережено');
+    fmtCache.clear();
+    render();
+  });
+
+  const confirmInput = el('input', { placeholder: me.user.login ?? '', 'aria-label': 'Ваш логін GitHub для підтвердження', autocomplete: 'off', style: { 'max-width': '220px' } });
+  const danger = el(
+    'form',
+    { class: 'card pad stack' },
+    el('p', { class: 'hint', style: { margin: '0' } }, 'Видалити акаунт разом з усіма проєктами, задачами, записами й ключами. Цього не скасувати. Для підтвердження введіть свій логін GitHub.'),
+    el('div', { class: 'row wrap', style: { gap: '8px' } }, confirmInput, el('button', { type: 'submit', class: 'btn sm danger' }, 'Видалити акаунт')),
+  );
+  danger.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    await act(() => api('/me', { method: 'DELETE', body: { confirm: confirmInput.value.trim() } }));
+    location.href = '/';
+  });
+
+  const step = (n, title, ...body) =>
+    el('li', { class: 'step' }, el('span', { class: 'num mono' }, String(n)), el('div', { class: 'stack', style: { gap: '8px', 'min-width': '0' } }, el('b', {}, title), ...body));
+
+  return el(
+    'div',
+    { class: 'stack', style: { gap: '28px' } },
+    el(
+      'section',
+      { class: 'section' },
+      el('h1', { class: 'label' }, 'Акаунт'),
+      el(
+        'div',
+        { class: 'card pad row between wrap' },
+        el(
+          'div',
+          { class: 'row' },
+          me.user.avatar_url ? el('img', { src: me.user.avatar_url, alt: '', width: 40, height: 40, class: 'avatar' }) : null,
+          el('div', { class: 'stack', style: { gap: '0' } }, el('b', {}, me.user.name || me.user.login || 'Ви'), el('span', { class: 'muted' }, me.user.login ? `@${me.user.login}` : '')),
+        ),
+        el(
+          'button',
+          {
+            type: 'button',
+            class: 'btn sm',
+            onclick: async () => {
+              await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
+              location.href = '/';
+            },
+          },
+          'Вийти',
+        ),
+      ),
+    ),
+    el(
+      'section',
+      { class: 'section' },
+      el('h2', { class: 'label' }, 'Підключення Claude'),
+      el(
+        'ol',
+        { class: 'steps card pad' },
+        step(
+          1,
+          'claude.ai і Claude Desktop',
+          el('p', { class: 'hint', style: { margin: '0' } }, 'Settings → Connectors → Add custom connector, адреса нижче. Далі — вхід через GitHub.'),
+          codeBlock(`${base}/mcp`, 'адресу MCP'),
+        ),
+        step(
+          2,
+          'Claude Code — одна команда',
+          el(
+            'p',
+            { class: 'hint', style: { margin: '0' } },
+            'Ставить хуки (час рахується сам) і MCP-сервер timer. «Копіювати» одразу підставить новий ключ для хуків.',
+          ),
+          fresh ? null : el('label', { class: 'field', style: { 'max-width': '260px' } }, 'Назва цього комп’ютера (для списку ключів)', keyName),
+          codeBlock(setupCmd(hooksKey), 'команду підключення Claude Code', fresh ? null : () => ensureHooksKey().then(setupCmd)),
+          fresh ? el('p', { class: 'hint warn-box', style: { margin: '0' } }, 'Ключ уже в команді. Виконайте її зараз — після переходу на іншу сторінку ключа не буде видно.') : null,
+          el('p', { class: 'hint', style: { margin: '0' } }, 'Потім перезапустіть Claude Code і введіть /mcp → timer → Authenticate — один раз увійти через GitHub.'),
+        ),
+      ),
+    ),
+    el(
+      'section',
+      { class: 'section' },
+      el('h2', { class: 'label' }, 'Ключі'),
+      el('p', { class: 'hint', style: { margin: '0' } }, 'Ключ «лише хуки» не відкриває ні даних, ні MCP. Непотрібні — відкликайте.'),
+      keyList,
+      el(
+        'details',
+        { class: 'card pad' },
+        el('summary', {}, 'Інші клієнти: MCP без входу через браузер'),
+        el(
+          'div',
+          { class: 'stack', style: { gap: '8px', 'margin-top': '12px' } },
+          el('p', { class: 'hint', style: { margin: '0' } }, 'Для клієнта, що не вміє OAuth, або сервера без браузера: повний ключ у заголовку Authorization.'),
+          el('div', {}, fullKeyBtn),
+          fullKeyOut,
+        ),
+      ),
+    ),
+    el('section', { class: 'section' }, el('h2', { class: 'label' }, 'Налаштування'), prefs),
+    el('section', { class: 'section' }, el('h2', { class: 'label' }, 'Небезпечна зона'), danger),
+  );
+}
+
 // ───────── старт
 
-const VIEWS = { now: viewNow, reports: viewReports, entries: viewEntries, projects: viewProjects };
+const VIEWS = { now: viewNow, reports: viewReports, entries: viewEntries, projects: viewProjects, settings: viewSettings };
 window.addEventListener('hashchange', () => {
+  // Свіжий ключ показуємо лише поки ви на сторінці налаштувань.
+  if (route().name !== 'settings') state.newKey = null;
   render();
   view.focus({ preventScroll: true });
   window.scrollTo(0, 0);
@@ -1316,15 +1665,14 @@ window.addEventListener('hashchange', () => {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && route().name === 'now') refresh();
 });
-// Хто увійшов — підказка на «Вийти» (ендпоінт Access, без API трекера).
-fetch('/cdn-cgi/access/get-identity', { credentials: 'same-origin' })
-  .then((r) => (r.ok ? r.json() : null))
-  .then((id) => {
-    if (id?.email) document.querySelector('.logout').title = `Ви увійшли як ${id.email}. Вийти`;
+// Хто увійшов: без сесії — лендінг із входом через GitHub.
+api('/me')
+  .then((me) => {
+    setMe(me);
+    // Новий користувач без жодного ключа — одразу на сторінку підключення.
+    if (!me.keys.length && !location.hash) location.hash = '#settings';
+    render();
   })
-  .catch(() => {});
-
-api('/config')
-  .then((c) => (state.tz = c.timezone || state.tz))
-  .catch(() => {})
-  .finally(render);
+  .catch((e) => {
+    if (!(e instanceof AuthError)) view.replaceChildren(el('div', { class: 'card empty' }, e.message));
+  });

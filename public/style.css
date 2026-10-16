@@ -70,7 +70,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .logo { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: 16px; font-weight: 500; }
 .tabs { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; }
 .tabs a[aria-current="page"] { color: var(--ink); font-weight: 500; }
-.top > .logout { margin-left: auto; font-size: 13px; }
 
 /* ── кнопки */
 .btn {
@@ -288,3 +287,41 @@ dialog h2 { font-size: 17px; font-weight: 600; }
   .toolbar input[type="search"] { max-width: none !important; }
   .seg button { padding: 0 10px; }
 }
+
+/* ── акаунт */
+.top > .me { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.top > .me[aria-current="page"] { color: var(--ink); font-weight: 500; }
+.top > .me img, .avatar { border-radius: 50%; background: var(--track); }
+body.anon .tabs, body.anon .top > .btn, body.anon .top > .me, body.anon .bottombar { display: none !important; }
+body.anon .shell { padding-bottom: 64px; }
+.landing { display: flex; flex-direction: column; gap: 20px; max-width: 720px; }
+.landing h1 { font-size: clamp(28px, 5vw, 40px); line-height: 1.1; font-weight: 600; letter-spacing: -0.02em; }
+.landing .lead { font-size: 17px; color: var(--ink-2); margin: 0; }
+.landing .shot { width: 100%; border-radius: 14px; box-shadow: 0 0 0 1px var(--ring); background: #121211; }
+.landing .features { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.landing .features li { background: var(--card); box-shadow: 0 0 0 1px var(--ring); border-radius: 14px; padding: 16px 18px; color: var(--ink-2); font-size: 14px; }
+.landing .features b { color: var(--ink); font-weight: 600; }
+.btn.lg { height: 48px; padding: 0 22px; font-size: 15px; border-radius: 12px; }
+.steps { list-style: none; margin: 0; display: flex; flex-direction: column; gap: 22px; }
+.step { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; }
+.step .num { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; background: var(--track); color: var(--ink-2); }
+.code { display: flex; align-items: flex-start; gap: 8px; background: var(--track); border-radius: 10px; padding: 10px 10px 10px 14px; }
+.code code { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; word-break: break-all; color: var(--ink); }
+.warn-box { margin: 0; color: var(--ink); }
+@media (max-width: 640px) {
+  .landing .features { grid-template-columns: minmax(0, 1fr); }
+  .top > .me span { display: none; }
+}
+
+details.card > summary { cursor: pointer; font-weight: 500; }
+details.card > summary::marker { color: var(--muted); }
+
+/* ── кілька сесій одного проєкту (Зараз): заголовок проєкту + вкладені рядки */
+.pgroup-head { padding-bottom: 6px; }
+.pgroup-head .big { color: var(--muted); font-size: 16px; }
+.list.nested { margin: 0 0 8px 42px; border-left: 2px solid var(--line); }
+.list.nested > li + li { border-top: 1px solid var(--line); }
+.list.nested .sess { padding: 10px 20px 10px 16px; }
+.list.nested .sess .name { font-weight: 500; }
+.list.nested .sess .big { font-size: 18px; }
+@media (max-width: 640px) { .list.nested { margin-left: 20px; } }

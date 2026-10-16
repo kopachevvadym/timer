@@ -1,14 +1,32 @@
 # Timer
 
-Особистий трекер часу роботи AI-агентів на кількох проєктах одночасно.
+Трекер часу для AI-агентів: кілька Claude Code паралельно — і чесна відповідь, скільки часу пішло на кожен проєкт.
 
 ![Екран «Зараз»: хто чекає на вас, хто працює, шкала дня з паралельністю](docs/screenshot.png)
 
-- **Хуки Claude Code** самі запускають і зупиняють таймер: промпт → старт, кінець відповіді → стоп, кожен виклик інструменту → heartbeat.
-- **Cloudflare Worker + D1** зберігає записи; cron кожні 5 хв закриває записи агентів, від яких 20 хв не було heartbeat.
-- **MCP-сервер** (`/mcp`) — звіти, підписи, ручний таймер і правки прямо з Claude Code.
-- **Веб-інтерфейс** — що йде зараз, звіт у трьох режимах, проєкти, записи.
-- **Terraform** — D1, Worker, Cloudflare Access. Код, домен і cron деплоїть Wrangler.
+- **Хуки Claude Code** самі запускають і зупиняють таймер: промпт → старт, кінець відповіді → стоп, запит дозволу → «чекає на вас», кожен виклик інструменту → heartbeat.
+- **MCP-сервер** (`/mcp`) — задачі, звіти, ручний таймер і правки з Claude Code, claude.ai і Claude Desktop.
+- **Веб-інтерфейс** — хто працює і хто чекає, звіти в трьох режимах, записи, проєкти й задачі.
+- **Кілька користувачів** — вхід через GitHub; кожен бачить лише своє.
+- **Cloudflare**: Worker + D1 + KV, Terraform для ресурсів, Wrangler для коду.
+
+## Як підключитися (timer.kopachev.life)
+
+1. Увійдіть через GitHub на [timer.kopachev.life](https://timer.kopachev.life) → «Налаштування».
+2. **claude.ai / Claude Desktop:** Settings → Connectors → Add custom connector → `https://timer.kopachev.life/mcp`. Вхід через GitHub, ключ не потрібен.
+3. **Claude Code — одна команда** (хуки для обліку часу + MCP-сервер `timer`). У «Налаштуваннях» кнопка «Копіювати» сама створює ключ для хуків і підставляє його:
+
+   ```bash
+   curl -fsSL https://timer.kopachev.life/install-hooks.mjs | node --input-type=module - https://timer.kopachev.life tk_КЛЮЧ
+   ```
+
+   Потім перезапустіть Claude Code і введіть `/mcp` → timer → Authenticate — один раз увійти через GitHub.
+
+Ключ у команді — «лише хуки»: він лежить у `~/.claude/settings.json` і не відкриває ні даних, ні MCP. Для MCP-клієнта без OAuth у «Налаштуваннях» → «Інші клієнти» можна створити повний ключ (заголовок `Authorization: Bearer tk_…`).
+
+Прибрати хуки: `node install-hooks.mjs --remove`; MCP — `claude mcp remove timer -s user`. Відкликати ключ — у «Налаштуваннях»; там само видаляється акаунт з усіма даними.
+
+**Приватність.** Трекер бачить назви папок, задач і час. Початок промпту зберігається лише якщо ви ввімкнете це в «Налаштуваннях». Ключі зберігаються як SHA-256, OAuth-токени — у KV лише як хеші.
 
 ## Як рахується час
 
@@ -19,100 +37,57 @@
 | Фокус (`focus`) | Час іде проєкту, куди ви востаннє надіслали промпт (або запустили ручний таймер). |
 
 **Реальний час** — коли йшов хоча б один запис. **Паралельність** = сума в повному режимі / реальний час.
-Записи через північ діляться між днями в часовому поясі `TIMEZONE`. Запущені записи входять у звіт «до зараз».
-
-Логіка: `src/allocate.ts` (розподіл), `src/service.ts` (правила), `src/time.ts` (дні й тижні з урахуванням переходу на літній час).
+Записи через північ діляться між днями у вашому часовому поясі («Налаштування»). Запущені записи входять у звіт «до зараз».
 
 ## Структура
 
 ```
-src/index.ts      маршрути: /hooks/claude, /api/*, /mcp, cron
-src/service.ts    бізнес-логіка (проєкти, задачі, записи, хуки, звіти)
+src/index.ts      маршрути: вхід GitHub, /authorize (згода OAuth), /hooks/claude, /api/*, /mcp, cron
+src/users.ts      користувачі, сесії (підписана cookie), API-ключі, GitHub OAuth
+src/service.ts    бізнес-логіка; кожен запит обмежений user_id
 src/allocate.ts   розподіл паралельного часу
 src/mcp.ts        MCP-інструменти
-src/access.ts     перевірка JWT від Cloudflare Access
 src/time.ts       межі днів/тижнів у часовому поясі
-public/           веб-інтерфейс (без збірки)
+public/           веб-інтерфейс (без збірки) і install-hooks.mjs
 migrations/       схема D1
-infra/            Terraform
-claude/           хуки для ~/.claude/settings.json
-scripts/smoke.sh  наскрізна перевірка проти локального сервера
+infra/            Terraform: D1, Worker, KV
+scripts/          smoke.sh, isolation.py (ізоляція користувачів + OAuth), chat-hook.sh
 ```
+
+## Свій екземпляр
+
+1. **GitHub OAuth App** (Settings → Developer settings → OAuth Apps): Homepage `https://<домен>`, callback `https://<домен>/auth/github/callback`.
+2. **Terraform** — база, Worker, KV:
+
+   ```bash
+   cd infra && cp terraform.tfvars.example terraform.tfvars   # account_id, hostname
+   export CLOUDFLARE_API_TOKEN=...                            # права — у versions.tf
+   terraform init && terraform apply
+   ```
+
+3. **wrangler.jsonc**: `routes[0].pattern` — домен; `database_id` — `terraform output -raw d1_database_id`; `kv_namespaces[0].id` — `terraform output -raw oauth_kv_id`; `vars.PUBLIC_URL`, `vars.OWNER_GITHUB_LOGIN`, `vars.GITHUB_CLIENT_ID`.
+4. **Секрети, міграції, деплой:**
+
+   ```bash
+   npx wrangler secret put SESSION_SECRET        # openssl rand -base64 48
+   npx wrangler secret put GITHUB_CLIENT_SECRET
+   npm run db:migrate:remote && npm run deploy
+   ```
+
+`OWNER_GITHUB_LOGIN` — хто забирає дані, створені до появи акаунтів (міграція 0005), при першому вході.
 
 ## Локально
 
 ```bash
 npm install
+printf 'SESSION_SECRET=%s\nGITHUB_CLIENT_SECRET=dev\nPUBLIC_URL=http://127.0.0.1:8787\n' "$(openssl rand -base64 32)" > .dev.vars
 npm run db:migrate:local
-npm run dev            # http://localhost:8787
-npm run smoke          # в іншому терміналі: симуляція трьох агентів, ручний таймер, звіт, MCP
-npm test               # allocate + часові пояси
+npx wrangler dev --local-upstream 127.0.0.1:8787   # вхід без GitHub: /auth/dev?login=alice (лише коли PUBLIC_URL з http://)
+python3 scripts/isolation.py                       # два користувачі, чужі id → 404, MCP з ключем і через OAuth
+python3 scripts/mcp-timer.py                       # таймер задач через MCP без хуків і з хуками
+TIMER_KEY=tk_… npm run smoke                       # агенти, ручний таймер, звіт, MCP
+npm test                                           # allocate + часові пояси
 ```
-
-## Деплой
-
-**1. Cloudflare Zero Trust.** Якщо ще немає — створіть команду (team domain виду `<team>.cloudflareaccess.com`) і увімкніть метод входу One-time PIN або Google у Settings → Authentication.
-
-**2. Terraform** — база, Worker, Access:
-
-```bash
-cd infra
-cp terraform.tfvars.example terraform.tfvars   # account_id, hostname, owner_email
-export CLOUDFLARE_API_TOKEN=...                # права див. у versions.tf
-terraform init && terraform apply
-```
-
-State містить `client_secret` service token — тримайте його в зашифрованому віддаленому backend, не в git.
-
-**3. wrangler.jsonc** — підставте значення:
-
-| Поле | Звідки |
-| --- | --- |
-| `routes[0].pattern` | ваш `hostname` |
-| `d1_databases[0].database_id` | `terraform output -raw d1_database_id` |
-| `vars.ACCESS_AUD` | `terraform output -raw access_aud` |
-| `vars.ACCESS_TEAM_DOMAIN` | `<team>.cloudflareaccess.com` |
-
-**4. Код і база:**
-
-```bash
-npx wrangler login
-npm run db:migrate:remote
-npm run deploy
-```
-
-**5. Claude Code.** Змінні середовища — у `~/.zshrc` (Claude Code має бачити їх під час запуску):
-
-```bash
-export TIMER_CF_ID="$(terraform -chdir=infra output -raw service_token_client_id)"
-export TIMER_CF_SECRET="$(terraform -chdir=infra output -raw service_token_client_secret)"
-```
-
-Хуки для всіх проєктів (повторний запуск не дублює; `--remove` прибирає):
-
-```bash
-node claude/install-hooks.mjs https://timer.example.com
-```
-
-MCP-сервер:
-
-```bash
-claude mcp add --transport http timer --scope user https://timer.example.com/mcp \
-  --header "CF-Access-Client-Id: $TIMER_CF_ID" \
-  --header "CF-Access-Client-Secret: $TIMER_CF_SECRET"
-```
-
-Перевірка: у Claude Code `/mcp` → `timer` connected; надішліть будь-який промпт і відкрийте `https://timer.example.com` — сесія має з’явитися в «Зараз».
-
-### Конектор у claude.ai / Claude Desktop
-
-В Access увімкнено Managed OAuth (`oauth_configuration` в `infra/main.tf`): Access сам є OAuth-сервером, вхід — та сама політика owner (код на пошту).
-
-1. Settings → Connectors → Add custom connector: URL `https://timer.<домен>/mcp`.
-2. Authentication — **Sign in now**; OAuth client — **Register automatically (DCR)** (CIMD Access не підтримує).
-3. Add → відкриється вхід Access → код із пошти.
-
-Дозволені redirect URI — `var.oauth_redirect_uris` (callback claude.ai / claude.com). Access-токен живе 15 хв, сесія — 14 днів.
 
 ## Проєкти й задачі
 
@@ -124,7 +99,7 @@ claude mcp add --transport http timer --scope user https://timer.example.com/mcp
 2. Одразу після виклику хук `PostToolUse` бачить, яка саме сесія його зробила, і прив’язує її до задачі. Час цієї сесії йде в задачу, зокрема в наступних ходах. Інші агенти в тому ж проєкті не зачіпаються.
 3. `timer_task_done` — задача «готово»; поточний інтервал розрізається, далі сесія працює в проєкті без задачі.
 
-MCP сам сесію не вгадує: при кількох агентах в одному проєкті так легко віддати час чужій сесії. Тому без встановлених хуків задача отримує статус, але час у неї не йде.
+Без хуків (claude.ai, Claude Desktop, хмарні сесії) час задачі рахує сам MCP: `timer_task_start` запускає таймер задачі, `timer_task_done` його зупиняє. Кілька задач одного проєкту можуть іти паралельно. Будь-який виклик MCP продовжує ці таймери; забутий таймер (4 год без жодного виклику) закривається на останньому виклику. Якщо ж хук прив'язав до задачі справжню сесію Claude Code, таймер MCP прибирається — час не рахується двічі. `timer_task_done` зупиняє все, що йде на задачі: сесії з хуками (вони продовжують у проєкт без задачі), таймер MCP і ручний таймер.
 
 У веб-інтерфейсі задачі видно в розділі «Проєкти»: додати (`LIN-42: назва` — номер розпізнається), позначити виконаною, запустити ручний таймер на задачу, видалити (час лишається в проєкті).
 
@@ -134,8 +109,6 @@ MCP сам сесію не вгадує: при кількох агентах в
 - **Звіти** — період, режим (повний / поділ / фокус), реальний час проти «агенти разом» по днях, проєкти, задачі, експорт CSV.
 - **Записи** — список із пошуком і панель правки: проєкт, задача, нотатка, початок і кінець; «Продовжити» запускає ручний таймер з тими ж даними.
 - **Проєкти** — шляхи, статистика, задачі (в роботі / до роботи / готово за 7 днів), перейменування, злиття, архів.
-
-Вхід — Cloudflare Access: код на пошту `owner_email`, сесія 7 днів. Вигляд сторінки входу (фон, текст, заголовок, підпис) задає `infra/login.tf`; «Вийти» у шапці веде на `/cdn-cgi/access/logout`. Логотипу на сторінці входу немає свідомо: він мав би відкриватися без входу, тобто потрібен виняток в Access.
 
 Стан «чекає» дають хуки `Stop`, `StopFailure` і `Notification`; наступний промпт або виклик інструменту повертає агента в «працюють».
 
@@ -163,13 +136,12 @@ MCP сам сесію не вгадує: при кількох агентах в
 - Нова тривалість рухає кінець запису, початок лишається (як у Toggl).
 - Назви активних проєктів унікальні без урахування регістру; автоматично створений проєкт отримує «назва (2)», якщо назва зайнята.
 - Час задачі у звіті — завжди «повний» (час агентів над нею); два агенти над однією задачею одночасно рахуються один раз.
-- Зміни даних із браузера приймаються лише з того самого сайту (`Sec-Fetch-Site`); cookie Access — `SameSite=Strict`, `HttpOnly`.
+- Кожен користувач бачить лише свої дані: усі запити до бази мають умову `user_id`, сесії агентів зберігаються з префіксом користувача. Перевірка — `scripts/isolation.py`.
+- Зміни даних із браузера приймаються лише з того самого сайту (`Sec-Fetch-Site`); cookie сесії — `__Host-`, `Secure`, `HttpOnly`, `SameSite=Lax`.
 - Список записів обмежений 1000 найновішими за період; UI і MCP кажуть, якщо щось не показано.
 
 ## Відомі обмеження
 
-- Час між запитом дозволу (`Notification`) і вашою відповіддю не рахується; після відповіді запис відновлюється з наступним викликом інструменту. Якщо хуки встановлено до появи `Notification`, перезапустіть `node claude/install-hooks.mjs <URL>`.
+- Час між запитом дозволу (`Notification`) і вашою відповіддю не рахується; після відповіді запис відновлюється з наступним викликом інструменту. Якщо хуки встановлено до появи `Notification`, виконайте команду підключення з «Налаштувань» ще раз.
 - Якщо модель думає довше `STALE_MINUTES` без жодного виклику інструменту, cron закриє запис раніше.
-- Початок промпту (до 140 символів) зберігається як нотатка. Вимкнути: `NOTE_FROM_PROMPT = "false"`.
-- Не перевірено на живому акаунті: чи підставляє Claude Code `$CLAUDE_PROJECT_DIR` у заголовки HTTP-хука (якщо ні — працює запасний варіант через `cwd`) і чи містить подія `UserPromptSubmit` поле `prompt` (якщо ні — нотатка буде порожньою).
-- `terraform validate` не запускався: у середовищі збірки не було доступу до реєстру Terraform. Запустіть `terraform validate && terraform plan` перед `apply`.
+- Початок промпту (до 140 символів) зберігається як нотатка, лише якщо користувач увімкнув це в «Налаштуваннях» (за замовчуванням вимкнено).

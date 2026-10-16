@@ -16,3 +16,5 @@ infra/.terraform.lock.hcl.bak
 .DS_Store
 infra/*.plan
 *.log
+.github-oauth
+.deploy-staging/

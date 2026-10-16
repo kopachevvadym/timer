@@ -5,12 +5,14 @@
 #   3) задачі: агент додає й починає задачу через MCP, хук прив'язує саме його сесію,
 #      сусідній агент у тому ж проєкті лишається без задачі; «готово» розрізає інтервал
 #   4) MCP: tools/list і кілька викликів
-# Запуск: npm run db:migrate:local && npm run dev   (в іншому терміналі)  →  npm run smoke
+# Запуск: npm run db:migrate:local && npm run dev   (в іншому терміналі)  →  TIMER_KEY=tk_… npm run smoke
 set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8787}"
 H=(-H 'content-type: application/json')
-# Для перевірки задеплоєного Worker за Access: CF_ID / CF_SECRET — service token.
-if [[ -n "${CF_ID:-}" ]]; then H+=(-H "CF-Access-Client-Id: $CF_ID" -H "CF-Access-Client-Secret: $CF_SECRET"); fi
+# API-ключ користувача (Налаштування → Ключ). Локально: python3 scripts/isolation.py створює своїх користувачів,
+# а для smoke візьміть ключ із /api/keys після входу через /auth/dev.
+: "${TIMER_KEY:?TIMER_KEY=tk_… — ключ користувача, від імені якого йде перевірка}"
+H+=(-H "Authorization: Bearer $TIMER_KEY")
 
 hook() { curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/hooks/claude" "${H[@]}" -d "$1"; echo " ← $2"; }
 mcp() {
@@ -61,7 +63,7 @@ sleep 1
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$S2\",\"cwd\":\"$P2\"}" "агент b закінчив"
 
 echo "== чекають на вас"
-nowapi() { curl -sS "$BASE/api/now" "${H[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    чекають:", [(w["session_id"][-1], w["waiting_reason"] or "закінчив хід", w["task_title"]) for w in d["waiting"] if w["session_id"].startswith("smoke")]); print("    працюють:", [(e["session_id"][-1], e["task_title"]) for e in d["running"] if e["source"]=="claude_code"]); t=d["today"]; print("    сьогодні: wall=%.1fs sum=%.1fs lanes=%s" % (t["wall_ms"]/1e3, t["sum_full_ms"]/1e3, [(l["name"], len(l["intervals"]), l["intervals"][-1][1] is None) for l in t["lanes"]]))'; }
+nowapi() { curl -sS "$BASE/api/now" "${H[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    чекають:", [(w["session_id"][-1], w["waiting_reason"] or "закінчив хід", w["task_title"]) for w in d["waiting"] if "smoke" in w["session_id"]]); print("    працюють:", [(e["session_id"][-1], e["task_title"]) for e in d["running"] if e["source"]=="claude_code"]); t=d["today"]; print("    сьогодні: wall=%.1fs sum=%.1fs lanes=%s" % (t["wall_ms"]/1e3, t["sum_full_ms"]/1e3, [(l["name"], len(l["intervals"]), l["intervals"][-1][1] is None) for l in t["lanes"]]))'; }
 nowapi   # очікую: b чекає (закінчив хід)
 hook "{\"hook_event_name\":\"Notification\",\"session_id\":\"$S3\",\"cwd\":\"$P1\",\"message\":\"Claude needs your permission to use Bash\"}" "агент c просить дозволу → чекає, час стоп"
 nowapi   # очікую: c чекає з причиною, c не працює
@@ -70,7 +72,8 @@ hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$S3\",\"cwd\":\"$P1\
 nowapi   # очікую: c працює → Тести API, не чекає
 
 echo "== зупинка сесій з вебу"
-stop_s() { curl -sS -X POST "$BASE/api/sessions/$1/stop" "${H[@]}"; echo " ← $2"; }
+UID_=$(curl -sS "$BASE/api/me" "${H[@]}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user"]["id"])')
+stop_s() { curl -sS -X POST "$BASE/api/sessions/$UID_:$1/stop" "${H[@]}"; echo " ← $2"; }
 stop_s "$S2" "прибрати b з «чекають»"
 stop_s "$S3" "зупинити c, що працює"
 hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$S3\",\"cwd\":\"$P1\",\"tool_name\":\"Bash\"}" "heartbeat c після ручного стопу не відновлює облік"

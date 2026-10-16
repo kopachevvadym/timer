@@ -14,6 +14,5 @@ terraform {
 }
 
 # Токен: змінна середовища CLOUDFLARE_API_TOKEN.
-# Потрібні права: Account → D1 Edit, Workers Scripts Edit, Access: Apps and Policies Edit,
-# Access: Service Tokens Edit, Access: Organizations, Identity Providers, and Groups Edit (вигляд сторінки входу).
+# Потрібні права: Account → D1 Edit, Workers Scripts Edit, Workers KV Storage Edit.
 provider "cloudflare" {}

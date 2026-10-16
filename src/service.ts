@@ -5,6 +5,10 @@
  * Словник: проєкт (projects) — папка/репозиторій, куди хуки пишуть час агентів;
  * задача (tasks) — конкретна робота всередині проєкту; запис (time_entries) — інтервал часу
  * проєкту, за бажанням прив'язаний до задачі.
+ *
+ * Кілька користувачів: кожна функція отримує Scope { db, uid } і бачить лише рядки з user_id = uid.
+ * Правило: КОЖЕН запит до projects / tasks / time_entries / agent_sessions / session_tasks /
+ * focus_switches / project_paths має умову user_id = uid (крім cron closeStale, що працює для всіх).
  */
 import { allocate, type Mode } from './allocate';
 import { days as dayRanges } from './time';
@@ -16,6 +20,12 @@ export class TimerError extends Error {
   ) {
     super(message);
   }
+}
+
+/** Доступ до даних одного користувача. */
+export interface Scope {
+  db: D1Database;
+  uid: string;
 }
 
 export interface Project {
@@ -74,6 +84,11 @@ export const MIN_MANUAL_MS = 60_000;
 
 const uid = () => crypto.randomUUID();
 
+/** Сесія агента в базі: '<user>:<session_id з Claude Code>' — чужий хук не зачепить вашу сесію. */
+export function sessionKey(userId: string, raw: string): string {
+  return `${userId}:${raw}`;
+}
+
 export function normalizePath(p: string): string {
   const t = p.trim();
   return t.length > 1 ? t.replace(/\/+$/, '') : t;
@@ -104,7 +119,48 @@ interface ProjectRow {
   archived_at: number | null;
 }
 
+const PROJECT_COLS = 'id, name, color, created_at, archived_at';
 const COLOR_RE = /^#[0-9a-f]{3,8}$/i;
+/** Обмеження на користувача — щоб один акаунт не з'їв базу. */
+export const LIMITS = {
+  projects: 500,
+  tasksPerProject: 2000,
+  tasksPerUser: 10_000,
+  pathsPerProject: 50,
+  /** Нових записів за добу (агент на кожен промпт створює один). */
+  entriesPerDay: 3000,
+  entriesTotal: 500_000,
+} as const;
+
+/** Чи вичерпано ліміт записів (за добу або загалом). */
+async function entryQuotaExceeded(s: Scope, now: number): Promise<boolean> {
+  const r = await s.db
+    .prepare(
+      `SELECT (SELECT COUNT(*) FROM time_entries WHERE user_id = ?1 AND started_at > ?2) AS day,
+              (SELECT COUNT(*) FROM time_entries WHERE user_id = ?1) AS total`,
+    )
+    .bind(s.uid, now - 24 * 3600_000)
+    .first<{ day: number; total: number }>();
+  return (r?.day ?? 0) >= LIMITS.entriesPerDay || (r?.total ?? 0) >= LIMITS.entriesTotal;
+}
+
+async function assertEntryQuota(s: Scope, now: number) {
+  if (await entryQuotaExceeded(s, now)) {
+    throw new TimerError(`Досягнуто ліміту записів (${LIMITS.entriesPerDay} за добу або ${LIMITS.entriesTotal} загалом)`, 429);
+  }
+}
+
+/** Перемикання фокусу; поспіль однаковий проєкт не пишемо — фокус від цього не змінюється. */
+function focusSwitch(s: Scope, projectId: string, now: number): D1PreparedStatement {
+  return s.db
+    .prepare(
+      `INSERT INTO focus_switches (at, project_id, user_id)
+       SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
+         SELECT 1 FROM focus_switches f WHERE f.user_id = ?3 AND f.project_id = ?2
+           AND f.at = (SELECT MAX(at) FROM focus_switches WHERE user_id = ?3))`,
+    )
+    .bind(now, projectId, s.uid);
+}
 
 function checkColor(color: string | null | undefined): string | null {
   if (color === undefined || color === null || color === '') return null;
@@ -113,206 +169,243 @@ function checkColor(color: string | null | undefined): string | null {
 }
 
 /** Назви активних проєктів унікальні (без урахування регістру), щоб MCP міг шукати проєкт за назвою. */
-async function nameTaken(db: D1Database, name: string, exceptId = ''): Promise<boolean> {
+async function nameTaken(s: Scope, name: string, exceptId = ''): Promise<boolean> {
   // lower() у SQLite знає лише ASCII, тому порівнюємо в JS (кирилиця).
   const key = lower(name);
   const rows = (
-    await db.prepare('SELECT id, name FROM projects WHERE archived_at IS NULL AND id != ?').bind(exceptId).all<{ id: string; name: string }>()
+    await s.db
+      .prepare('SELECT id, name FROM projects WHERE user_id = ? AND archived_at IS NULL AND id != ?')
+      .bind(s.uid, exceptId)
+      .all<{ id: string; name: string }>()
   ).results;
   return rows.some((r) => lower(r.name) === key);
 }
 
 /** «api» → «api (2)», якщо «api» вже зайнята. */
-async function uniqueName(db: D1Database, base: string, exceptId = ''): Promise<string> {
+async function uniqueName(s: Scope, base: string, exceptId = ''): Promise<string> {
   let name = base;
-  for (let i = 2; await nameTaken(db, name, exceptId); i++) name = `${base} (${i})`;
+  for (let i = 2; await nameTaken(s, name, exceptId); i++) name = `${base} (${i})`;
   return name;
 }
 
-async function withPaths(db: D1Database, rows: ProjectRow[]): Promise<Project[]> {
+async function withPaths(s: Scope, rows: ProjectRow[]): Promise<Project[]> {
   if (rows.length === 0) return [];
-  const paths = (await db.prepare('SELECT path, project_id FROM project_paths ORDER BY path').all<{ path: string; project_id: string }>()).results;
+  const paths = (
+    await s.db.prepare('SELECT path, project_id FROM project_paths WHERE user_id = ? ORDER BY path').bind(s.uid).all<{ path: string; project_id: string }>()
+  ).results;
   const byProject = new Map<string, string[]>();
   for (const p of paths) byProject.set(p.project_id, [...(byProject.get(p.project_id) ?? []), p.path]);
   return rows.map((r) => ({ ...r, paths: byProject.get(r.id) ?? [] }));
 }
 
-export async function listProjects(db: D1Database, includeArchived = false): Promise<Project[]> {
+export async function listProjects(s: Scope, includeArchived = false): Promise<Project[]> {
   const sql = includeArchived
-    ? 'SELECT * FROM projects ORDER BY archived_at IS NOT NULL, name'
-    : 'SELECT * FROM projects WHERE archived_at IS NULL ORDER BY name';
-  return withPaths(db, (await db.prepare(sql).all<ProjectRow>()).results);
+    ? `SELECT ${PROJECT_COLS} FROM projects WHERE user_id = ? ORDER BY archived_at IS NOT NULL, name`
+    : `SELECT ${PROJECT_COLS} FROM projects WHERE user_id = ? AND archived_at IS NULL ORDER BY name`;
+  return withPaths(s, (await s.db.prepare(sql).bind(s.uid).all<ProjectRow>()).results);
 }
 
-export async function getProject(db: D1Database, id: string): Promise<Project> {
-  const p = await db.prepare('SELECT * FROM projects WHERE id = ?').bind(id).first<ProjectRow>();
+export async function getProject(s: Scope, id: string): Promise<Project> {
+  const p = await s.db.prepare(`SELECT ${PROJECT_COLS} FROM projects WHERE id = ? AND user_id = ?`).bind(id, s.uid).first<ProjectRow>();
   if (!p) throw new TimerError(`Проєкт ${id} не знайдено`, 404);
-  return (await withPaths(db, [p]))[0];
+  return (await withPaths(s, [p]))[0];
 }
 
 /** Проєкт за id або назвою (активний має пріоритет над архівним). */
-export async function findProjectByRef(db: D1Database, ref: string): Promise<Project | null> {
-  const all = await listProjects(db, true);
+export async function findProjectByRef(s: Scope, ref: string): Promise<Project | null> {
+  const all = await listProjects(s, true);
   const r = lower(ref);
   const byName = all.filter((p) => lower(p.name) === r);
   return all.find((p) => p.id === ref.trim()) ?? byName.find((p) => p.archived_at === null) ?? byName[0] ?? null;
 }
 
 /** Проєкт, чий шлях — найдовший префікс cwd. */
-export async function findProjectByPath(db: D1Database, cwd: string): Promise<Project | null> {
+export async function findProjectByPath(s: Scope, cwd: string): Promise<Project | null> {
   const path = normalizePath(cwd);
-  const all = (await db.prepare('SELECT path, project_id FROM project_paths').all<{ path: string; project_id: string }>()).results;
+  const all = (
+    await s.db.prepare('SELECT path, project_id FROM project_paths WHERE user_id = ?').bind(s.uid).all<{ path: string; project_id: string }>()
+  ).results;
   let best: { path: string; project_id: string } | null = null;
   for (const p of all) {
     if ((path === p.path || path.startsWith(`${p.path}/`)) && (!best || p.path.length > best.path.length)) best = p;
   }
-  return best ? getProject(db, best.project_id) : null;
+  return best ? getProject(s, best.project_id) : null;
+}
+
+async function assertProjectQuota(s: Scope) {
+  const n = await s.db.prepare('SELECT COUNT(*) AS n FROM projects WHERE user_id = ?').bind(s.uid).first<{ n: number }>();
+  if ((n?.n ?? 0) >= LIMITS.projects) throw new TimerError(`Досягнуто ліміту в ${LIMITS.projects} проєктів — об'єднайте або видаліть зайві`, 429);
 }
 
 /** Знайти проєкт для cwd або створити новий з назвою останньої папки. */
-export async function resolveProject(db: D1Database, cwd: string, now: number): Promise<Project> {
-  const found = await findProjectByPath(db, cwd);
+export async function resolveProject(s: Scope, cwd: string, now: number): Promise<Project> {
+  const { db } = s;
+  const found = await findProjectByPath(s, cwd);
   if (found) {
     if (found.archived_at !== null) {
       // Агент знову працює в архівному проєкті — повертаємо його з архіву (з вільною назвою).
-      const name = await uniqueName(db, found.name, found.id);
-      await db.prepare('UPDATE projects SET archived_at = NULL, name = ? WHERE id = ?').bind(name, found.id).run();
+      const name = await uniqueName(s, found.name, found.id);
+      await db.prepare('UPDATE projects SET archived_at = NULL, name = ? WHERE id = ? AND user_id = ?').bind(name, found.id, s.uid).run();
       return { ...found, name, archived_at: null };
     }
     return found;
   }
   const path = normalizePath(cwd);
+  if (!path.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(path)) throw new TimerError('cwd має бути абсолютним шляхом');
+  const base = summarize(basename(cwd), 80) ?? 'project';
+  // Проєкт з такою ж назвою, створений вручну (через веб чи MCP) і ще без шляху, — це він:
+  // прив'язуємо папку до нього замість дубля «назва (2)».
+  const sameName = (await listProjects(s)).find((p) => lower(p.name) === lower(base) && p.paths.length === 0);
+  if (sameName) {
+    await db.prepare('INSERT INTO project_paths (user_id, path, project_id) VALUES (?, ?, ?) ON CONFLICT(user_id, path) DO NOTHING').bind(s.uid, path, sameName.id).run();
+    return (await findProjectByPath(s, cwd)) ?? getProject(s, sameName.id);
+  }
+  await assertProjectQuota(s);
   const id = uid();
-  const name = await uniqueName(db, basename(cwd));
+  const name = await uniqueName(s, base);
   await db.batch([
-    db.prepare('INSERT INTO projects (id, name, color, created_at) VALUES (?, ?, NULL, ?)').bind(id, name, now),
+    db.prepare('INSERT INTO projects (id, user_id, name, color, created_at) VALUES (?, ?, ?, NULL, ?)').bind(id, s.uid, name, now),
     // Два агенти одночасно в новій папці: шлях дістається першому, другий підхопить його проєкт нижче.
-    db.prepare('INSERT INTO project_paths (path, project_id) VALUES (?, ?) ON CONFLICT(path) DO NOTHING').bind(path, id),
+    db.prepare('INSERT INTO project_paths (user_id, path, project_id) VALUES (?, ?, ?) ON CONFLICT(user_id, path) DO NOTHING').bind(s.uid, path, id),
   ]);
-  const owner = await findProjectByPath(db, cwd);
+  const owner = await findProjectByPath(s, cwd);
   if (owner && owner.id !== id) {
-    await db.prepare('DELETE FROM projects WHERE id = ?').bind(id).run();
+    await db.prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').bind(id, s.uid).run();
     return owner;
   }
-  return owner ?? getProject(db, id);
+  return owner ?? getProject(s, id);
 }
 
 export async function createProject(
-  db: D1Database,
+  s: Scope,
   input: { name: string; path?: string | null; color?: string | null },
   now: number,
 ): Promise<Project> {
-  const name = input.name?.trim();
+  const { db } = s;
+  const name = summarize(input.name, 80);
   if (!name) throw new TimerError('Потрібна назва проєкту');
-  if (await nameTaken(db, name)) throw new TimerError(`Проєкт «${name}» уже є`, 409);
+  if (await nameTaken(s, name)) throw new TimerError(`Проєкт «${name}» уже є`, 409);
+  await assertProjectQuota(s);
   const id = uid();
-  const stmts = [db.prepare('INSERT INTO projects (id, name, color, created_at) VALUES (?, ?, ?, ?)').bind(id, name, checkColor(input.color), now)];
-  if (input.path) stmts.push(db.prepare('INSERT INTO project_paths (path, project_id) VALUES (?, ?)').bind(normalizePath(input.path), id));
+  const stmts = [
+    db.prepare('INSERT INTO projects (id, user_id, name, color, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, s.uid, name, checkColor(input.color), now),
+  ];
+  if (input.path) {
+    stmts.push(db.prepare('INSERT INTO project_paths (user_id, path, project_id) VALUES (?, ?, ?)').bind(s.uid, normalizePath(input.path), id));
+  }
   try {
     await db.batch(stmts);
   } catch (e) {
     if (String(e).includes('UNIQUE')) throw new TimerError(`Шлях ${input.path} уже прив'язаний до іншого проєкту`, 409);
     throw e;
   }
-  return getProject(db, id);
+  return getProject(s, id);
 }
 
 export async function updateProject(
-  db: D1Database,
+  s: Scope,
   id: string,
   patch: { name?: string; color?: string | null; archived?: boolean },
   now: number,
 ): Promise<Project> {
-  const p = await getProject(db, id);
-  const newName = patch.name?.trim();
-  if (newName && (await nameTaken(db, newName, id))) throw new TimerError(`Проєкт «${newName}» уже є`, 409);
-  if (patch.archived === false && p.archived_at !== null && (await nameTaken(db, newName || p.name, id))) {
+  const { db } = s;
+  const p = await getProject(s, id);
+  const newName = patch.name === undefined ? undefined : summarize(patch.name, 80);
+  if (newName && (await nameTaken(s, newName, id))) throw new TimerError(`Проєкт «${newName}» уже є`, 409);
+  if (patch.archived === false && p.archived_at !== null && (await nameTaken(s, newName || p.name, id))) {
     throw new TimerError(`Активний проєкт «${p.name}» уже є — спершу перейменуйте один із них`, 409);
   }
   const name = newName || p.name;
   const color = patch.color === undefined ? p.color : checkColor(patch.color);
   const archivedAt = patch.archived === undefined ? p.archived_at : patch.archived ? (p.archived_at ?? now) : null;
-  const stmts = [db.prepare('UPDATE projects SET name = ?, color = ?, archived_at = ? WHERE id = ?').bind(name, color, archivedAt, id)];
+  const stmts = [db.prepare('UPDATE projects SET name = ?, color = ?, archived_at = ? WHERE id = ? AND user_id = ?').bind(name, color, archivedAt, id, s.uid)];
   // Архівний проєкт не може йти: зупиняємо його ручні таймери.
   if (patch.archived) {
     stmts.push(
       db
-        .prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE project_id = ? AND session_id = ? AND stopped_at IS NULL')
-        .bind(now, now, id, MANUAL),
+        .prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE user_id = ? AND project_id = ? AND session_id = ? AND stopped_at IS NULL')
+        .bind(now, now, s.uid, id, MANUAL),
     );
   }
   await db.batch(stmts);
-  return getProject(db, id);
+  return getProject(s, id);
 }
 
 /** Прив'язати шлях на диску до проєкту (хуки шукатимуть проєкт за ним). */
-export async function addProjectPath(db: D1Database, id: string, path: string): Promise<Project> {
-  await getProject(db, id);
+export async function addProjectPath(s: Scope, id: string, path: string): Promise<Project> {
+  const { db } = s;
+  const project = await getProject(s, id);
   const p = normalizePath(path);
-  if (!p.startsWith('/')) throw new TimerError('Шлях має бути абсолютним');
-  const owner = await db.prepare('SELECT project_id FROM project_paths WHERE path = ?').bind(p).first<{ project_id: string }>();
+  if (!p.startsWith('/') || p.length > 1000) throw new TimerError('Шлях має бути абсолютним');
+  if (project.paths.length >= LIMITS.pathsPerProject) throw new TimerError(`У проєкту вже ${LIMITS.pathsPerProject} шляхів`, 429);
+  const owner = await db.prepare('SELECT project_id FROM project_paths WHERE user_id = ? AND path = ?').bind(s.uid, p).first<{ project_id: string }>();
   if (owner && owner.project_id !== id) throw new TimerError(`Шлях ${p} уже прив'язаний до іншого проєкту — об'єднайте проєкти (merge)`, 409);
-  await db.prepare('INSERT INTO project_paths (path, project_id) VALUES (?, ?) ON CONFLICT(path) DO NOTHING').bind(p, id).run();
-  return getProject(db, id);
+  await db.prepare('INSERT INTO project_paths (user_id, path, project_id) VALUES (?, ?, ?) ON CONFLICT(user_id, path) DO NOTHING').bind(s.uid, p, id).run();
+  return getProject(s, id);
 }
 
-export async function removeProjectPath(db: D1Database, id: string, path: string): Promise<Project> {
-  await db.prepare('DELETE FROM project_paths WHERE path = ? AND project_id = ?').bind(normalizePath(path), id).run();
-  return getProject(db, id);
+export async function removeProjectPath(s: Scope, id: string, path: string): Promise<Project> {
+  await getProject(s, id);
+  await s.db.prepare('DELETE FROM project_paths WHERE user_id = ? AND path = ? AND project_id = ?').bind(s.uid, normalizePath(path), id).run();
+  return getProject(s, id);
 }
 
 /** Перенести записи, задачі й шляхи проєкту `fromId` у `intoId` і видалити `fromId`. */
-export async function mergeProjects(db: D1Database, fromId: string, intoId: string, now: number): Promise<Project> {
+export async function mergeProjects(s: Scope, fromId: string, intoId: string, now: number): Promise<Project> {
+  const { db, uid: u } = s;
   if (fromId === intoId) throw new TimerError('Не можна об’єднати проєкт сам із собою');
-  await getProject(db, fromId);
-  await getProject(db, intoId);
+  // Обидва проєкти мають належати цьому користувачу — інакше 404.
+  await getProject(s, fromId);
+  await getProject(s, intoId);
   // Ручні записи одного проєкту не перекриваються — перевіряємо до перенесення.
   const clash = await db
     .prepare(
       `SELECT a.id FROM time_entries a JOIN time_entries b
-         ON a.project_id = ? AND b.project_id = ? AND a.session_id = ? AND b.session_id = ?
-        AND a.started_at < COALESCE(b.stopped_at, ?) AND COALESCE(a.stopped_at, ?) > b.started_at
+         ON a.user_id = ?1 AND b.user_id = ?1 AND a.project_id = ?2 AND b.project_id = ?3 AND a.session_id = ?4 AND b.session_id = ?4
+        AND a.started_at < COALESCE(b.stopped_at, ?5) AND COALESCE(a.stopped_at, ?5) > b.started_at
        LIMIT 1`,
     )
-    .bind(fromId, intoId, MANUAL, MANUAL, now, now)
+    .bind(u, fromId, intoId, MANUAL, now)
     .first();
   if (clash) throw new TimerError('Ручні записи цих проєктів перекриваються — спершу виправте їх', 409);
   await db.batch([
     // Запущені записи зупиняємо, щоб не зламати «один запущений запис на сесію».
-    db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE project_id = ? AND stopped_at IS NULL').bind(now, now, fromId),
-    db.prepare('UPDATE time_entries SET project_id = ? WHERE project_id = ?').bind(intoId, fromId),
-    db.prepare('UPDATE tasks SET project_id = ? WHERE project_id = ?').bind(intoId, fromId),
-    db.prepare('UPDATE session_tasks SET project_id = ? WHERE project_id = ?').bind(intoId, fromId),
-    db.prepare('UPDATE agent_sessions SET project_id = ? WHERE project_id = ?').bind(intoId, fromId),
-    db.prepare('UPDATE focus_switches SET project_id = ? WHERE project_id = ?').bind(intoId, fromId),
-    db.prepare('UPDATE project_paths SET project_id = ? WHERE project_id = ?').bind(intoId, fromId),
-    db.prepare('DELETE FROM projects WHERE id = ?').bind(fromId),
+    db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE user_id = ? AND project_id = ? AND stopped_at IS NULL').bind(now, now, u, fromId),
+    db.prepare('UPDATE time_entries SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    db.prepare('UPDATE tasks SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    db.prepare('UPDATE session_tasks SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    db.prepare('UPDATE agent_sessions SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    db.prepare('UPDATE focus_switches SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    db.prepare('UPDATE project_paths SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    db.prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').bind(fromId, u),
   ]);
-  return getProject(db, intoId);
+  return getProject(s, intoId);
 }
 
 // ───────────────────────────── Задачі ─────────────────────────────
 
-const TASK_WITH_TIME = (nowParam: string) => `
-  SELECT t.*, p.name AS project_name,
-    COALESCE((SELECT SUM(COALESCE(e.stopped_at, ${nowParam}) - e.started_at) FROM time_entries e WHERE e.task_id = t.id), 0) AS spent_ms,
-    (SELECT COUNT(*) FROM time_entries e WHERE e.task_id = t.id AND e.stopped_at IS NULL) AS active_sessions
-  FROM tasks t JOIN projects p ON p.id = t.project_id`;
+/** ?1 = now, ?2 = user_id. */
+const TASK_WITH_TIME = `
+  SELECT t.id, t.project_id, t.title, t.notes, t.status, t.external_ref, t.created_at, t.done_at, p.name AS project_name,
+    COALESCE((SELECT SUM(COALESCE(e.stopped_at, ?1) - e.started_at) FROM time_entries e WHERE e.task_id = t.id AND e.user_id = ?2), 0) AS spent_ms,
+    (SELECT COUNT(*) FROM time_entries e WHERE e.task_id = t.id AND e.user_id = ?2 AND e.stopped_at IS NULL) AS active_sessions
+  FROM tasks t JOIN projects p ON p.id = t.project_id AND p.user_id = ?2
+  WHERE t.user_id = ?2`;
 
-export async function getTask(db: D1Database, id: string, now = Date.now()): Promise<TaskWithTime> {
-  const t = await db.prepare(`${TASK_WITH_TIME('?1')} WHERE t.id = ?2`).bind(now, id).first<TaskWithTime>();
+export async function getTask(s: Scope, id: string, now = Date.now()): Promise<TaskWithTime> {
+  const t = await s.db.prepare(`${TASK_WITH_TIME} AND t.id = ?3`).bind(now, s.uid, id).first<TaskWithTime>();
   if (!t) throw new TimerError(`Задачу ${id} не знайдено`, 404);
   return t;
 }
 
 /** Задачі проєкту (або всіх проєктів). open = todo + doing. */
 export async function listTasks(
-  db: D1Database,
+  s: Scope,
   q: { projectId?: string; status?: 'open' | 'done' | 'all' },
   now: number,
 ): Promise<TaskWithTime[]> {
   const where: string[] = [];
-  const args: unknown[] = [now];
+  const args: unknown[] = [now, s.uid];
   if (q.projectId) {
     where.push(`t.project_id = ?${args.length + 1}`);
     args.push(q.projectId);
@@ -320,20 +413,20 @@ export async function listTasks(
   const status = q.status ?? 'open';
   if (status === 'open') where.push("t.status != 'done'");
   if (status === 'done') where.push("t.status = 'done'");
-  const sql = `${TASK_WITH_TIME('?1')}${where.length ? ` WHERE ${where.join(' AND ')}` : ''}
+  const sql = `${TASK_WITH_TIME}${where.map((w) => ` AND ${w}`).join('')}
     ORDER BY CASE t.status WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END, COALESCE(t.done_at, t.created_at) DESC`;
-  return (await db.prepare(sql).bind(...args).all<TaskWithTime>()).results;
+  return (await s.db.prepare(sql).bind(...args).all<TaskWithTime>()).results;
 }
 
 /**
  * Задача за посиланням у межах проєкту: id, номер у трекері (LIN-42) або назва без урахування регістру.
  * Кілька збігів за назвою — помилка зі списком, щоб агент уточнив.
  */
-export async function findTaskByRef(db: D1Database, ref: string, projectId: string | null, now: number): Promise<TaskWithTime | null> {
+export async function findTaskByRef(s: Scope, ref: string, projectId: string | null, now: number): Promise<TaskWithTime | null> {
   const r = ref.trim();
-  const byId = await db.prepare(`${TASK_WITH_TIME('?1')} WHERE t.id = ?2`).bind(now, r).first<TaskWithTime>();
+  const byId = await s.db.prepare(`${TASK_WITH_TIME} AND t.id = ?3`).bind(now, s.uid, r).first<TaskWithTime>();
   if (byId) return byId;
-  const pool = await listTasks(db, { projectId: projectId ?? undefined, status: 'all' }, now);
+  const pool = await listTasks(s, { projectId: projectId ?? undefined, status: 'all' }, now);
   const key = lower(r);
   const byRef = pool.filter((t) => t.external_ref && lower(t.external_ref) === key);
   const byTitle = pool.filter((t) => lower(t.title) === key);
@@ -350,86 +443,136 @@ export async function findTaskByRef(db: D1Database, ref: string, projectId: stri
 }
 
 export async function createTask(
-  db: D1Database,
+  s: Scope,
   input: { project_id: string; title: string; notes?: string | null; external_ref?: string | null },
   now: number,
 ): Promise<TaskWithTime> {
-  const project = await getProject(db, input.project_id);
+  const project = await getProject(s, input.project_id);
   if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`);
   const title = summarize(input.title, 200);
   if (!title) throw new TimerError('Потрібна назва задачі');
+  const n = await s.db
+    .prepare('SELECT (SELECT COUNT(*) FROM tasks WHERE user_id = ?1 AND project_id = ?2) AS inProject, (SELECT COUNT(*) FROM tasks WHERE user_id = ?1) AS total')
+    .bind(s.uid, project.id)
+    .first<{ inProject: number; total: number }>();
+  if ((n?.inProject ?? 0) >= LIMITS.tasksPerProject) throw new TimerError(`У проєкті вже ${LIMITS.tasksPerProject} задач`, 429);
+  if ((n?.total ?? 0) >= LIMITS.tasksPerUser) throw new TimerError(`Досягнуто ліміту в ${LIMITS.tasksPerUser} задач — видаліть старі`, 429);
   const id = uid();
-  await db
-    .prepare('INSERT INTO tasks (id, project_id, title, notes, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, project.id, title, input.notes?.trim() || null, 'todo', input.external_ref?.trim() || null, now)
+  await s.db
+    .prepare('INSERT INTO tasks (id, user_id, project_id, title, notes, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(id, s.uid, project.id, title, summarize(input.notes, 1000), 'todo', summarize(input.external_ref, 60), now)
     .run();
-  return getTask(db, id, now);
+  return getTask(s, id, now);
 }
 
 /** Запущені записи агентів над задачею — щоб продовжити їх без задачі. */
-async function runningForTask(db: D1Database, taskId: string) {
+async function runningForTask(s: Scope, taskId: string) {
   return (
-    await db
-      .prepare("SELECT project_id, session_id, note FROM time_entries WHERE task_id = ? AND stopped_at IS NULL AND source = 'claude_code'")
-      .bind(taskId)
+    await s.db
+      .prepare(
+        "SELECT project_id, session_id, note FROM time_entries WHERE user_id = ? AND task_id = ? AND stopped_at IS NULL AND source = 'claude_code' AND session_id NOT LIKE ?",
+      )
+      .bind(s.uid, taskId, `${s.uid}:mcp:%`)
       .all<{ project_id: string; session_id: string; note: string | null }>()
   ).results;
 }
 
+// ───────────── Таймер задачі через MCP (клієнти без хуків) ─────────────
+//
+// claude.ai, Claude Desktop і хмарні сесії не мають хуків Claude Code, тож час їхніх задач
+// рахується від timer_task_start до timer_task_done окремим записом із сесією `<uid>:mcp:<task_id>`.
+// Якщо хук потім прив'яже до задачі справжню сесію агента (Claude Code CLI), цей запис прибираємо,
+// щоб час не рахувався двічі.
+
+export const mcpSessionId = (uid: string, taskId: string) => `${uid}:mcp:${taskId}`;
+export const isMcpSession = (sessionId: string) => /^[^:]+:mcp:/.test(sessionId);
+/** Таймер задачі через MCP без жодного виклику довше за це — вважаємо забутим і закриваємо на останній активності. */
+export const MCP_IDLE_MS = 4 * 3600_000;
+
+/** Запустити таймер задачі, якщо час у неї ще не йде (ні від хука, ні від MCP). true — запущено. */
+export async function startMcpTimer(s: Scope, task: { id: string; project_id: string }, now: number): Promise<boolean> {
+  const running = await s.db
+    .prepare("SELECT 1 FROM time_entries WHERE user_id = ? AND task_id = ? AND stopped_at IS NULL AND source = 'claude_code' LIMIT 1")
+    .bind(s.uid, task.id)
+    .first();
+  if (running) return false;
+  await assertEntryQuota(s, now);
+  try {
+    await insertEntry(s, task.project_id, task.id, mcpSessionId(s.uid, task.id), 'claude_code', now, null).run();
+  } catch (e) {
+    // Паралельний виклик уже запустив (one_running_per_session) — це не помилка.
+    if (String(e).includes('UNIQUE')) return false;
+    throw e;
+  }
+  return true;
+}
+
+/** Будь-який виклик MCP — ознака, що агент живий: продовжуємо його таймери задач. */
+export function touchMcpTimers(s: Scope, now: number): Promise<unknown> {
+  return s.db
+    .prepare('UPDATE time_entries SET last_seen_at = ? WHERE user_id = ? AND stopped_at IS NULL AND session_id LIKE ?')
+    .bind(now, s.uid, `${s.uid}:mcp:%`)
+    .run();
+}
+
 export async function updateTask(
-  db: D1Database,
+  s: Scope,
   id: string,
   patch: { title?: string; notes?: string | null; external_ref?: string | null; status?: TaskStatus },
   now: number,
 ): Promise<TaskWithTime> {
-  const t = await getTask(db, id, now);
+  const { db, uid: u } = s;
+  const t = await getTask(s, id, now);
   const title = patch.title === undefined ? t.title : summarize(patch.title, 200);
   if (!title) throw new TimerError('Назва задачі не може бути порожньою');
   const status = patch.status ?? t.status;
   if (!['todo', 'doing', 'done'].includes(status)) throw new TimerError('status: todo | doing | done');
   const doneAt = status === 'done' ? (t.done_at ?? now) : null;
   const stmts: D1PreparedStatement[] = [];
-  if (status === 'done' && t.status !== 'done') {
-    // Закриваємо поточні інтервали задачі; агенти продовжують працювати вже без задачі.
+  if ((status === 'done' && t.status !== 'done') || (status === 'todo' && t.status === 'doing')) {
+    // Закриваємо всі поточні інтервали задачі: хуки, таймер MCP і ручний таймер.
+    // Сесії агентів із хуками працюють далі вже без задачі.
     // Порядок: спершу закрити (інакше впремося в one_running_per_session), потім відкрити продовження.
-    const reopen = await runningForTask(db, id);
+    const reopen = await runningForTask(s, id);
     stmts.push(
-      db.prepare("UPDATE time_entries SET stopped_at = ?1, last_seen_at = ?1 WHERE task_id = ?2 AND stopped_at IS NULL AND source = 'claude_code'").bind(now, id),
-      ...reopen.map((r) => insertEntry(db, r.project_id, null, r.session_id, 'claude_code', now, r.note)),
-      db.prepare('DELETE FROM session_tasks WHERE task_id = ?').bind(id),
+      db.prepare('UPDATE time_entries SET stopped_at = ?1, last_seen_at = ?1 WHERE user_id = ?2 AND task_id = ?3 AND stopped_at IS NULL').bind(now, u, id),
+      ...reopen.map((r) => insertEntry(s, r.project_id, null, r.session_id, 'claude_code', now, r.note)),
+      db.prepare('DELETE FROM session_tasks WHERE user_id = ? AND task_id = ?').bind(u, id),
     );
   }
   stmts.push(
     db
-      .prepare('UPDATE tasks SET title = ?, notes = ?, external_ref = ?, status = ?, done_at = ? WHERE id = ?')
+      .prepare('UPDATE tasks SET title = ?, notes = ?, external_ref = ?, status = ?, done_at = ? WHERE id = ? AND user_id = ?')
       .bind(
         title,
-        patch.notes === undefined ? t.notes : patch.notes?.trim() || null,
-        patch.external_ref === undefined ? t.external_ref : patch.external_ref?.trim() || null,
+        patch.notes === undefined ? t.notes : summarize(patch.notes, 1000),
+        patch.external_ref === undefined ? t.external_ref : summarize(patch.external_ref, 60),
         status,
         doneAt,
         id,
+        u,
       ),
   );
   await db.batch(stmts);
-  return getTask(db, id, now);
+  return getTask(s, id, now);
 }
 
 /**
  * Видалити задачу. Час не губиться: записи лишаються в проєкті без задачі.
  * Запущені записи агентів розриваються так само, як при «готово».
  */
-export async function deleteTask(db: D1Database, id: string, now: number): Promise<void> {
-  await getTask(db, id, now);
+export async function deleteTask(s: Scope, id: string, now: number): Promise<void> {
+  const { db, uid: u } = s;
+  await getTask(s, id, now);
   // Порядок важливий: спершу закрити запущений інтервал задачі, потім відкрити продовження без задачі
   // (інакше впремося в one_running_per_session), і лише тоді відв'язати старі записи.
-  const reopen = await runningForTask(db, id);
+  const reopen = await runningForTask(s, id);
   await db.batch([
-    db.prepare("UPDATE time_entries SET stopped_at = ?1, last_seen_at = ?1 WHERE task_id = ?2 AND stopped_at IS NULL").bind(now, id),
-    db.prepare('UPDATE time_entries SET task_id = NULL WHERE task_id = ?').bind(id),
-    ...reopen.map((r) => insertEntry(db, r.project_id, null, r.session_id, 'claude_code', now, r.note)),
-    db.prepare('DELETE FROM session_tasks WHERE task_id = ?').bind(id),
-    db.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
+    db.prepare('UPDATE time_entries SET stopped_at = ?1, last_seen_at = ?1 WHERE user_id = ?2 AND task_id = ?3 AND stopped_at IS NULL').bind(now, u, id),
+    db.prepare('UPDATE time_entries SET task_id = NULL WHERE user_id = ? AND task_id = ?').bind(u, id),
+    ...reopen.map((r) => insertEntry(s, r.project_id, null, r.session_id, 'claude_code', now, r.note)),
+    db.prepare('DELETE FROM session_tasks WHERE user_id = ? AND task_id = ?').bind(u, id),
+    db.prepare('DELETE FROM tasks WHERE id = ? AND user_id = ?').bind(id, u),
   ]);
 }
 
@@ -437,44 +580,54 @@ export async function deleteTask(db: D1Database, id: string, now: number): Promi
  * Почати роботу над задачею: статус doing, і час сесії агента відтепер іде в задачу.
  * Сесію знає лише хук (PostToolUse після timer_task_start несе session_id). MCP-виклик сам сесію
  * не вгадує: при кількох агентах у проєкті так легко віддати час чужій сесії.
+ * sessionId — вже з префіксом користувача (sessionKey).
  */
 export async function startTask(
-  db: D1Database,
+  s: Scope,
   taskId: string,
   now: number,
   sessionId?: string,
 ): Promise<{ task: TaskWithTime; bound: boolean }> {
-  const t = await getTask(db, taskId, now);
+  const { db, uid: u } = s;
+  const t = await getTask(s, taskId, now);
   if (t.status === 'done') throw new TimerError(`Задача «${t.title}» уже виконана — відкрийте її знову (status: todo)`);
-  const session = sessionId;
   let bound = false;
   const stmts: D1PreparedStatement[] = [];
-  if (t.status === 'todo') stmts.push(db.prepare("UPDATE tasks SET status = 'doing' WHERE id = ?").bind(t.id));
-  if (session && session !== MANUAL) {
+  if (t.status === 'todo') stmts.push(db.prepare("UPDATE tasks SET status = 'doing' WHERE id = ? AND user_id = ?").bind(t.id, u));
+  if (sessionId && sessionId !== MANUAL && sessionId.startsWith(`${u}:`)) {
     bound = true;
     stmts.push(
       db
         .prepare(
-          `INSERT INTO session_tasks (session_id, task_id, project_id, set_at) VALUES (?1, ?2, ?3, ?4)
-           ON CONFLICT(session_id) DO UPDATE SET task_id = ?2, project_id = ?3, set_at = ?4`,
+          `INSERT INTO session_tasks (session_id, user_id, task_id, project_id, set_at) VALUES (?1, ?5, ?2, ?3, ?4)
+           ON CONFLICT(session_id) DO UPDATE SET task_id = ?2, project_id = ?3, set_at = ?4 WHERE user_id = ?5`,
         )
-        .bind(session, t.id, t.project_id, now),
+        .bind(sessionId, t.id, t.project_id, now, u),
     );
     const running = await db
-      .prepare('SELECT * FROM time_entries WHERE session_id = ? AND project_id = ? AND stopped_at IS NULL')
-      .bind(session, t.project_id)
+      .prepare('SELECT * FROM time_entries WHERE user_id = ? AND session_id = ? AND project_id = ? AND stopped_at IS NULL')
+      .bind(u, sessionId, t.project_id)
       .first<Entry>();
     if (running && running.task_id === null) {
       // Хід агента щойно почався без задачі — віддаємо його задачі цілком.
-      stmts.push(db.prepare('UPDATE time_entries SET task_id = ?, last_seen_at = ? WHERE id = ?').bind(t.id, now, running.id));
+      stmts.push(db.prepare('UPDATE time_entries SET task_id = ?, last_seen_at = ? WHERE id = ? AND user_id = ?').bind(t.id, now, running.id, u));
     } else if (running && running.task_id !== t.id) {
       // Агент переключився з іншої задачі посеред ходу — ріжемо інтервал.
-      stmts.push(db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE id = ?').bind(now, now, running.id));
-      stmts.push(insertEntry(db, t.project_id, t.id, session, 'claude_code', now, running.note));
+      stmts.push(db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE id = ? AND user_id = ?').bind(now, now, running.id, u));
+      stmts.push(insertEntry(s, t.project_id, t.id, sessionId, 'claude_code', now, running.note));
     }
   }
+  if (bound) {
+    // Час задачі тепер рахує хук: таймер MCP цієї задачі зайвий. Щойно запущений (той самий виклик
+    // timer_task_start) — видаляємо; давніший — закриваємо, щоб не втратити вже пораховане.
+    const mcp = mcpSessionId(u, t.id);
+    stmts.push(
+      db.prepare('DELETE FROM time_entries WHERE user_id = ? AND session_id = ? AND stopped_at IS NULL AND started_at >= ?').bind(u, mcp, now - 5 * 60_000),
+      db.prepare('UPDATE time_entries SET stopped_at = ?1, last_seen_at = ?1 WHERE user_id = ?2 AND session_id = ?3 AND stopped_at IS NULL').bind(now, u, mcp),
+    );
+  }
   if (stmts.length) await db.batch(stmts);
-  return { task: await getTask(db, t.id, now), bound };
+  return { task: await getTask(s, t.id, now), bound };
 }
 
 // ───────────────────────────── Хуки Claude Code ─────────────────────────────
@@ -508,62 +661,73 @@ const inList = (list: readonly string[], e: string) => list.includes(e);
 const TASK_START_TOOL = /__timer_task_(start|add)$/;
 
 /** Задача, до якої прив'язана сесія в цьому проєкті (якщо вона ще не виконана). */
-async function boundTask(db: D1Database, sessionId: string, projectId: string): Promise<string | null> {
-  const row = await db
+async function boundTask(s: Scope, sessionId: string, projectId: string): Promise<string | null> {
+  const row = await s.db
     .prepare(
-      `SELECT st.task_id FROM session_tasks st JOIN tasks t ON t.id = st.task_id
-       WHERE st.session_id = ? AND st.project_id = ? AND t.status != 'done'`,
+      `SELECT st.task_id FROM session_tasks st JOIN tasks t ON t.id = st.task_id AND t.user_id = st.user_id
+       WHERE st.user_id = ? AND st.session_id = ? AND st.project_id = ? AND t.status != 'done'`,
     )
-    .bind(sessionId, projectId)
+    .bind(s.uid, sessionId, projectId)
     .first<{ task_id: string }>();
   return row?.task_id ?? null;
 }
 
 /** Сесія працює: upsert стану. */
-function sessionWorking(db: D1Database, sessionId: string, projectId: string, now: number, prompt: string | null): D1PreparedStatement {
-  return db
+function sessionWorking(s: Scope, sessionId: string, projectId: string, now: number, prompt: string | null): D1PreparedStatement {
+  return s.db
     .prepare(
-      `INSERT INTO agent_sessions (session_id, project_id, state, last_prompt, waiting_reason, waiting_since, started_at, updated_at)
-       VALUES (?1, ?2, 'working', ?3, NULL, NULL, ?4, ?4)
+      `INSERT INTO agent_sessions (session_id, user_id, project_id, state, last_prompt, waiting_reason, waiting_since, started_at, updated_at)
+       VALUES (?1, ?5, ?2, 'working', ?3, NULL, NULL, ?4, ?4)
        ON CONFLICT(session_id) DO UPDATE SET project_id = ?2, state = 'working', last_prompt = COALESCE(?3, last_prompt),
-         waiting_reason = NULL, waiting_since = NULL, stopped_by_user_at = NULL, updated_at = ?4`,
+         waiting_reason = NULL, waiting_since = NULL, stopped_by_user_at = NULL, updated_at = ?4
+       WHERE user_id = ?5`,
     )
-    .bind(sessionId, projectId, prompt, now);
+    .bind(sessionId, projectId, prompt, now, s.uid);
 }
 
-function stopSessionEntries(db: D1Database, sessionId: string, now: number): D1PreparedStatement {
-  return db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE session_id = ? AND stopped_at IS NULL').bind(now, now, sessionId);
+function stopSessionEntries(s: Scope, sessionId: string, now: number): D1PreparedStatement {
+  return s.db
+    .prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE user_id = ? AND session_id = ? AND stopped_at IS NULL')
+    .bind(now, now, s.uid, sessionId);
 }
 
+/**
+ * Подія хука Claude Code. `input.session_id` — сирий id з Claude Code; у базі він зберігається
+ * з префіксом користувача, тож сесії різних людей ніколи не перетинаються.
+ */
 export async function handleHook(
-  db: D1Database,
+  s: Scope,
   input: HookInput,
   now: number,
   opts: { noteFromPrompt: boolean },
 ): Promise<'started' | 'heartbeat' | 'stopped' | 'waiting' | 'ended' | 'bound' | 'ignored'> {
+  const { db, uid: u } = s;
   const event = input.hook_event_name ?? '';
-  const sessionId = input.session_id;
-  if (!sessionId || sessionId === MANUAL) return 'ignored';
+  const raw = typeof input.session_id === 'string' ? input.session_id.slice(0, 200) : '';
+  if (!raw || raw === MANUAL) return 'ignored';
+  const sessionId = sessionKey(u, raw);
 
   if (inList(HOOK_EVENTS.end, event)) {
     await db.batch([
-      stopSessionEntries(db, sessionId, now),
+      stopSessionEntries(s, sessionId, now),
       // Сесія закрита — її прив'язка до задачі більше не потрібна.
-      db.prepare('DELETE FROM session_tasks WHERE session_id = ?').bind(sessionId),
-      db.prepare("UPDATE agent_sessions SET state = 'ended', waiting_since = NULL, waiting_reason = NULL, updated_at = ? WHERE session_id = ?").bind(now, sessionId),
+      db.prepare('DELETE FROM session_tasks WHERE user_id = ? AND session_id = ?').bind(u, sessionId),
+      db
+        .prepare("UPDATE agent_sessions SET state = 'ended', waiting_since = NULL, waiting_reason = NULL, updated_at = ? WHERE user_id = ? AND session_id = ?")
+        .bind(now, u, sessionId),
     ]);
     return 'ended';
   }
 
   if (inList(HOOK_EVENTS.stop, event)) {
     await db.batch([
-      stopSessionEntries(db, sessionId, now),
+      stopSessionEntries(s, sessionId, now),
       db
         .prepare(
           `UPDATE agent_sessions SET state = 'waiting', waiting_reason = ?, waiting_since = ?, updated_at = ?
-           WHERE session_id = ? AND state != 'ended'`,
+           WHERE user_id = ? AND session_id = ? AND state != 'ended'`,
         )
-        .bind(event === 'StopFailure' ? 'Хід обірвався з помилкою API' : null, now, now, sessionId),
+        .bind(event === 'StopFailure' ? 'Хід обірвався з помилкою API' : null, now, now, u, sessionId),
     ]);
     return 'stopped';
   }
@@ -572,15 +736,15 @@ export async function handleHook(
     // Запит дозволу посеред ходу або нагадування після ходу: зупиняємо облік, позначаємо «чекає».
     // Наступний PostToolUse (дозвіл дали) відновить запис через самовідновлення нижче.
     await db.batch([
-      stopSessionEntries(db, sessionId, now),
+      stopSessionEntries(s, sessionId, now),
       db
         .prepare(
           // Причину беремо лише з сповіщення посеред ходу (запит дозволу); нагадування після ходу її не перетирає.
           `UPDATE agent_sessions SET waiting_reason = CASE WHEN state = 'working' THEN ? ELSE waiting_reason END,
              state = 'waiting', waiting_since = COALESCE(waiting_since, ?), updated_at = ?
-           WHERE session_id = ? AND state != 'ended'`,
+           WHERE user_id = ? AND session_id = ? AND state != 'ended'`,
         )
-        .bind(summarize(input.message, 200), now, now, sessionId),
+        .bind(summarize(input.message, 200), now, now, u, sessionId),
     ]);
     return 'waiting';
   }
@@ -589,34 +753,38 @@ export async function handleHook(
   if (!dir) return 'ignored';
 
   if (inList(HOOK_EVENTS.start, event)) {
-    const project = await resolveProject(db, dir, now);
+    const project = await resolveProject(s, dir, now);
     const note = opts.noteFromPrompt ? summarize(input.prompt) : null;
-    const bound = await boundTask(db, sessionId, project.id);
+    const bound = await boundTask(s, sessionId, project.id);
     const running = (
-      await db.prepare('SELECT * FROM time_entries WHERE session_id = ? AND stopped_at IS NULL').bind(sessionId).all<Entry>()
+      await db.prepare('SELECT * FROM time_entries WHERE user_id = ? AND session_id = ? AND stopped_at IS NULL').bind(u, sessionId).all<Entry>()
     ).results;
     const stmts: D1PreparedStatement[] = [];
     let alreadyRunning = false;
     for (const r of running) {
       if (r.project_id === project.id) {
         alreadyRunning = true;
-        stmts.push(db.prepare('UPDATE time_entries SET last_seen_at = ? WHERE id = ?').bind(now, r.id));
+        stmts.push(db.prepare('UPDATE time_entries SET last_seen_at = ? WHERE id = ? AND user_id = ?').bind(now, r.id, u));
       } else {
         // Сесія перейшла в інший проєкт (змінився cwd) — закриваємо старий запис.
-        stmts.push(db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE id = ?').bind(now, now, r.id));
+        stmts.push(db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE id = ? AND user_id = ?').bind(now, now, r.id, u));
       }
     }
-    if (!alreadyRunning) stmts.push(insertEntry(db, project.id, bound, sessionId, 'claude_code', now, note));
-    stmts.push(db.prepare('INSERT INTO focus_switches (at, project_id) VALUES (?, ?)').bind(now, project.id));
-    stmts.push(sessionWorking(db, sessionId, project.id, now, note));
+    if (!alreadyRunning) {
+      // Ліміт вичерпано — хук мовчки нічого не пише (агенту помилка не потрібна).
+      if (await entryQuotaExceeded(s, now)) return 'ignored';
+      stmts.push(insertEntry(s, project.id, bound, sessionId, 'claude_code', now, note));
+    }
+    stmts.push(focusSwitch(s, project.id, now));
+    stmts.push(sessionWorking(s, sessionId, project.id, now, note));
     await db.batch(stmts);
     return 'started';
   }
 
   if (inList(HOOK_EVENTS.heartbeat, event)) {
     const res = await db
-      .prepare('UPDATE time_entries SET last_seen_at = ? WHERE session_id = ? AND stopped_at IS NULL')
-      .bind(now, sessionId)
+      .prepare('UPDATE time_entries SET last_seen_at = ? WHERE user_id = ? AND session_id = ? AND stopped_at IS NULL')
+      .bind(now, u, sessionId)
       .run();
     let result: 'started' | 'heartbeat' | 'bound' = 'heartbeat';
     let projectId: string | null = null;
@@ -625,20 +793,22 @@ export async function handleHook(
       // Продовжуємо облік — з тією самою задачею, до якої прив'язана сесія.
       // Виняток: сесію зупинили вручну з вебу — тоді чекаємо нового промпту.
       const session = await db
-        .prepare('SELECT last_prompt, stopped_by_user_at FROM agent_sessions WHERE session_id = ?')
-        .bind(sessionId)
+        .prepare('SELECT last_prompt, stopped_by_user_at FROM agent_sessions WHERE user_id = ? AND session_id = ?')
+        .bind(u, sessionId)
         .first<{ last_prompt: string | null; stopped_by_user_at: number | null }>();
-      if (session?.stopped_by_user_at) return 'ignored';
-      const project = await resolveProject(db, dir, now);
+      if (session?.stopped_by_user_at || (await entryQuotaExceeded(s, now))) return 'ignored';
+      const project = await resolveProject(s, dir, now);
       projectId = project.id;
-      await insertEntry(db, project.id, await boundTask(db, sessionId, project.id), sessionId, 'claude_code', now, session?.last_prompt ?? null).run();
+      await insertEntry(s, project.id, await boundTask(s, sessionId, project.id), sessionId, 'claude_code', now, session?.last_prompt ?? null).run();
       result = 'started';
     }
-    if (projectId) await sessionWorking(db, sessionId, projectId, now, null).run();
+    if (projectId) await sessionWorking(s, sessionId, projectId, now, null).run();
     else {
       await db
-        .prepare("UPDATE agent_sessions SET state = 'working', waiting_since = NULL, waiting_reason = NULL, updated_at = ? WHERE session_id = ? AND state != 'ended'")
-        .bind(now, sessionId)
+        .prepare(
+          "UPDATE agent_sessions SET state = 'working', waiting_since = NULL, waiting_reason = NULL, updated_at = ? WHERE user_id = ? AND session_id = ? AND state != 'ended'",
+        )
+        .bind(now, u, sessionId)
         .run();
     }
     // Агент викликав timer_task_start / timer_task_add(start) — тепер знаємо його сесію точно.
@@ -649,12 +819,12 @@ export async function handleHook(
         const ref = String((isAdd ? ti.title : ti.task) ?? '').trim();
         const projectRef = typeof ti.project === 'string' ? ti.project : null;
         const project = projectRef
-          ? await findProjectByRef(db, projectRef)
-          : await findProjectByPath(db, typeof ti.cwd === 'string' && ti.cwd ? ti.cwd : dir);
+          ? await findProjectByRef(s, projectRef)
+          : await findProjectByPath(s, typeof ti.cwd === 'string' && ti.cwd ? ti.cwd : dir);
         if (ref && project) {
-          const task = await findTaskByRef(db, ref, project.id, now).catch(() => null);
+          const task = await findTaskByRef(s, ref, project.id, now).catch(() => null);
           if (task && task.status !== 'done') {
-            await startTask(db, task.id, now, sessionId);
+            await startTask(s, task.id, now, sessionId);
             result = 'bound';
           }
         }
@@ -667,7 +837,7 @@ export async function handleHook(
 }
 
 function insertEntry(
-  db: D1Database,
+  s: Scope,
   projectId: string,
   taskId: string | null,
   sessionId: string,
@@ -676,28 +846,30 @@ function insertEntry(
   note: string | null,
   stop: number | null = null,
 ): D1PreparedStatement {
-  return db
+  return s.db
     .prepare(
-      'INSERT INTO time_entries (id, project_id, task_id, session_id, source, started_at, stopped_at, last_seen_at, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO time_entries (id, user_id, project_id, task_id, session_id, source, started_at, stopped_at, last_seen_at, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     )
-    .bind(uid(), projectId, taskId, sessionId, source, start, stop, stop ?? start, note);
+    .bind(uid(), s.uid, projectId, taskId, sessionId, source, start, stop, stop ?? start, note);
 }
 
 /**
  * Зупинити сесію агента вручну (з вебу): закрити її запущені записи й прибрати з «Працюють» / «Чекають».
  * Heartbeat-и цієї сесії більше не відновлюють облік; новий промпт (UserPromptSubmit) — відновлює.
  * Прив'язка до задачі лишається: якщо агент продовжить, час знову піде в ту саму задачу.
+ * sessionId — внутрішній (з префіксом користувача), як його повертають listRunning / listWaiting.
  */
-export async function stopSession(db: D1Database, sessionId: string, now: number): Promise<{ stopped: number }> {
+export async function stopSession(s: Scope, sessionId: string, now: number): Promise<{ stopped: number }> {
   if (!sessionId || sessionId === MANUAL) throw new TimerError('Ручні таймери зупиняються за проєктом: POST /api/projects/:id/stop');
-  const [res, sess] = await db.batch([
-    stopSessionEntries(db, sessionId, now),
-    db
+  if (!sessionId.startsWith(`${s.uid}:`)) throw new TimerError(`Сесію ${sessionId} не знайдено`, 404);
+  const [res, sess] = await s.db.batch([
+    stopSessionEntries(s, sessionId, now),
+    s.db
       .prepare(
         `UPDATE agent_sessions SET state = 'ended', waiting_reason = NULL, waiting_since = NULL, stopped_by_user_at = ?1, updated_at = ?1
-         WHERE session_id = ?2`,
+         WHERE user_id = ?2 AND session_id = ?3`,
       )
-      .bind(now, sessionId),
+      .bind(now, s.uid, sessionId),
   ]);
   const stopped = res.meta.changes ?? 0;
   if (stopped === 0 && (sess.meta.changes ?? 0) === 0) throw new TimerError(`Сесію ${sessionId} не знайдено`, 404);
@@ -705,15 +877,21 @@ export async function stopSession(db: D1Database, sessionId: string, now: number
 }
 
 /**
- * Cron: закрити записи агентів без heartbeat, прибрати порожні й підчистити стан сесій.
+ * Cron: закрити записи агентів без heartbeat, прибрати порожні й підчистити стан сесій — для всіх користувачів.
  * Сесія, що «працює» без запущеного запису (агент упав, термінал закрили), вважається завершеною;
  * «чекає» довше доби — теж.
  */
 export async function closeStale(db: D1Database, now: number, staleMs: number): Promise<number> {
-  const [closed] = await db.batch([
+  const [closed, closedMcp] = await db.batch([
     db
-      .prepare("UPDATE time_entries SET stopped_at = last_seen_at WHERE stopped_at IS NULL AND source = 'claude_code' AND last_seen_at < ?")
+      .prepare(
+        "UPDATE time_entries SET stopped_at = last_seen_at WHERE stopped_at IS NULL AND source = 'claude_code' AND session_id NOT LIKE '%:mcp:%' AND last_seen_at < ?",
+      )
       .bind(now - staleMs),
+    // Таймери задач через MCP не мають хуків-«пульсу»: живуть довше, закриваються на останньому виклику MCP.
+    db
+      .prepare("UPDATE time_entries SET stopped_at = last_seen_at WHERE stopped_at IS NULL AND session_id LIKE '%:mcp:%' AND last_seen_at < ?")
+      .bind(now - MCP_IDLE_MS),
     db.prepare("DELETE FROM time_entries WHERE source = 'claude_code' AND stopped_at IS NOT NULL AND stopped_at - started_at < 1000"),
     db
       .prepare(
@@ -725,7 +903,7 @@ export async function closeStale(db: D1Database, now: number, staleMs: number): 
       .bind(now, now - staleMs, now - 24 * 3600_000),
     db.prepare("DELETE FROM agent_sessions WHERE state = 'ended' AND updated_at < ?").bind(now - 7 * 24 * 3600_000),
   ]);
-  return closed.meta.changes ?? 0;
+  return (closed.meta.changes ?? 0) + (closedMcp.meta.changes ?? 0);
 }
 
 // ───────────────────────────── Екран «Зараз» ─────────────────────────────
@@ -746,22 +924,23 @@ export interface WaitingSession {
   entry_stopped_at: number | null;
 }
 
-export async function listWaiting(db: D1Database): Promise<WaitingSession[]> {
+export async function listWaiting(s: Scope): Promise<WaitingSession[]> {
   return (
-    await db
+    await s.db
       .prepare(
         `SELECT s.session_id, s.project_id, p.name AS project_name, p.color AS project_color, s.last_prompt, s.waiting_reason, s.waiting_since,
                 t.title AS task_title, t.external_ref AS task_ref,
                 le.id AS entry_id, le.started_at AS entry_started_at, le.stopped_at AS entry_stopped_at
          FROM agent_sessions s
-         JOIN projects p ON p.id = s.project_id
+         JOIN projects p ON p.id = s.project_id AND p.user_id = ?1
          LEFT JOIN time_entries le ON le.id = (
-           SELECT id FROM time_entries WHERE session_id = s.session_id ORDER BY started_at DESC LIMIT 1)
-         LEFT JOIN session_tasks st ON st.session_id = s.session_id AND st.project_id = s.project_id
-         LEFT JOIN tasks t ON t.id = st.task_id AND t.status != 'done'
-         WHERE s.state = 'waiting'
+           SELECT id FROM time_entries WHERE user_id = ?1 AND session_id = s.session_id ORDER BY started_at DESC LIMIT 1)
+         LEFT JOIN session_tasks st ON st.session_id = s.session_id AND st.project_id = s.project_id AND st.user_id = ?1
+         LEFT JOIN tasks t ON t.id = st.task_id AND t.status != 'done' AND t.user_id = ?1
+         WHERE s.user_id = ?1 AND s.state = 'waiting'
          ORDER BY s.waiting_since`,
       )
+      .bind(s.uid)
       .all<WaitingSession>()
   ).results;
 }
@@ -787,11 +966,11 @@ export interface Timeline {
 }
 
 /** Шкала дня: коли працював кожен проєкт і скільки разом. */
-export async function dayTimeline(db: D1Database, from: number, to: number, now: number): Promise<Timeline> {
+export async function dayTimeline(s: Scope, from: number, to: number, now: number): Promise<Timeline> {
   const entries = (
-    await db
-      .prepare('SELECT project_id, started_at, stopped_at FROM time_entries WHERE started_at < ? AND (stopped_at IS NULL OR stopped_at > ?)')
-      .bind(to, from)
+    await s.db
+      .prepare('SELECT project_id, started_at, stopped_at FROM time_entries WHERE user_id = ? AND started_at < ? AND (stopped_at IS NULL OR stopped_at > ?)')
+      .bind(s.uid, to, from)
       .all<{ project_id: string; started_at: number; stopped_at: number | null }>()
   ).results;
   const end = Math.min(to, now);
@@ -804,13 +983,13 @@ export async function dayTimeline(db: D1Database, from: number, to: number, now:
   );
   const byProject = new Map<string, { s: number; e: number; live: boolean }[]>();
   for (const e of entries) {
-    const s = Math.max(e.started_at, from);
+    const st = Math.max(e.started_at, from);
     const live = e.stopped_at === null;
     const x = Math.min(e.stopped_at ?? now, end);
-    if (x <= s) continue;
-    byProject.set(e.project_id, [...(byProject.get(e.project_id) ?? []), { s, e: x, live }]);
+    if (x <= st) continue;
+    byProject.set(e.project_id, [...(byProject.get(e.project_id) ?? []), { s: st, e: x, live }]);
   }
-  const projects = new Map((await listProjects(db, true)).map((p) => [p.id, p]));
+  const projects = new Map((await listProjects(s, true)).map((p) => [p.id, p]));
   const lanes: TimelineLane[] = [...byProject.entries()].map(([pid, list]) => {
     list.sort((a, b) => a.s - b.s);
     const merged: { s: number; e: number; live: boolean }[] = [];
@@ -837,35 +1016,37 @@ export async function dayTimeline(db: D1Database, from: number, to: number, now:
 
 // ───────────────────────────── Ручний таймер ─────────────────────────────
 
-async function checkTaskInProject(db: D1Database, taskId: string | null | undefined, projectId: string, now: number) {
+async function checkTaskInProject(s: Scope, taskId: string | null | undefined, projectId: string, now: number) {
   if (!taskId) return null;
-  const t = await getTask(db, taskId, now);
+  const t = await getTask(s, taskId, now);
   if (t.project_id !== projectId) throw new TimerError(`Задача «${t.title}» належить проєкту «${t.project_name}»`);
   return t;
 }
 
 export async function startManual(
-  db: D1Database,
+  s: Scope,
   projectId: string,
   note: string | null,
   now: number,
   taskId?: string | null,
 ): Promise<Entry> {
-  const project = await getProject(db, projectId);
+  const { db, uid: u } = s;
+  const project = await getProject(s, projectId);
   if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`);
-  const task = await checkTaskInProject(db, taskId, projectId, now);
+  const task = await checkTaskInProject(s, taskId, projectId, now);
   if (task?.status === 'done') throw new TimerError(`Задача «${task.title}» уже виконана`);
   const running = await db
-    .prepare('SELECT id FROM time_entries WHERE project_id = ? AND session_id = ? AND stopped_at IS NULL')
-    .bind(projectId, MANUAL)
+    .prepare('SELECT id FROM time_entries WHERE user_id = ? AND project_id = ? AND session_id = ? AND stopped_at IS NULL')
+    .bind(u, projectId, MANUAL)
     .first();
   if (running) throw new TimerError(`Таймер «${project.name}» уже йде`, 409);
+  await assertEntryQuota(s, now);
   const stmts = [
-    insertEntry(db, projectId, task?.id ?? null, MANUAL, 'manual', now, summarize(note, 500)),
+    insertEntry(s, projectId, task?.id ?? null, MANUAL, 'manual', now, summarize(note, 500)),
     // Ручний старт теж переносить фокус (режим focus у звітах).
-    db.prepare('INSERT INTO focus_switches (at, project_id) VALUES (?, ?)').bind(now, projectId),
+    focusSwitch(s, projectId, now),
   ];
-  if (task?.status === 'todo') stmts.push(db.prepare("UPDATE tasks SET status = 'doing' WHERE id = ?").bind(task.id));
+  if (task?.status === 'todo') stmts.push(db.prepare("UPDATE tasks SET status = 'doing' WHERE id = ? AND user_id = ?").bind(task.id, u));
   try {
     await db.batch(stmts);
   } catch (e) {
@@ -874,21 +1055,18 @@ export async function startManual(
     throw e;
   }
   return (await db
-    .prepare('SELECT * FROM time_entries WHERE project_id = ? AND session_id = ? AND stopped_at IS NULL')
-    .bind(projectId, MANUAL)
+    .prepare('SELECT * FROM time_entries WHERE user_id = ? AND project_id = ? AND session_id = ? AND stopped_at IS NULL')
+    .bind(u, projectId, MANUAL)
     .first<Entry>())!;
 }
 
 /** Зупинити ручні таймери (одного проєкту або всіх). Короткі записи відкидаються. */
-export async function stopManual(
-  db: D1Database,
-  now: number,
-  projectId?: string,
-): Promise<{ stopped: number; discarded: number }> {
+export async function stopManual(s: Scope, now: number, projectId?: string): Promise<{ stopped: number; discarded: number }> {
+  const { db, uid: u } = s;
   const running = (
     await db
-      .prepare(`SELECT * FROM time_entries WHERE session_id = ? AND stopped_at IS NULL${projectId ? ' AND project_id = ?' : ''}`)
-      .bind(...(projectId ? [MANUAL, projectId] : [MANUAL]))
+      .prepare(`SELECT * FROM time_entries WHERE user_id = ? AND session_id = ? AND stopped_at IS NULL${projectId ? ' AND project_id = ?' : ''}`)
+      .bind(...(projectId ? [u, MANUAL, projectId] : [u, MANUAL]))
       .all<Entry>()
   ).results;
   if (running.length === 0) return { stopped: 0, discarded: 0 };
@@ -896,79 +1074,69 @@ export async function stopManual(
   const stmts = running.map((r) => {
     if (now - r.started_at < MIN_MANUAL_MS) {
       discarded++;
-      return db.prepare('DELETE FROM time_entries WHERE id = ?').bind(r.id);
+      return db.prepare('DELETE FROM time_entries WHERE id = ? AND user_id = ?').bind(r.id, u);
     }
-    return db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE id = ?').bind(now, now, r.id);
+    return db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE id = ? AND user_id = ?').bind(now, now, r.id, u);
   });
   await db.batch(stmts);
   return { stopped: running.length - discarded, discarded };
 }
 
 /** Зупинити всі ручні таймери і запустити один — звична поведінка Toggl. */
-export async function switchTo(
-  db: D1Database,
-  projectId: string,
-  note: string | null,
-  now: number,
-  taskId?: string | null,
-): Promise<Entry> {
-  const project = await getProject(db, projectId);
+export async function switchTo(s: Scope, projectId: string, note: string | null, now: number, taskId?: string | null): Promise<Entry> {
+  const project = await getProject(s, projectId);
   // Перевіряємо до зупинки інших таймерів, щоб невдалий перемикач нічого не зламав.
   if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`);
-  const task = await checkTaskInProject(db, taskId, projectId, now);
+  const task = await checkTaskInProject(s, taskId, projectId, now);
   if (task?.status === 'done') throw new TimerError(`Задача «${task.title}» уже виконана`);
-  await stopManual(db, now);
-  return startManual(db, projectId, note, now, taskId);
+  await stopManual(s, now);
+  return startManual(s, projectId, note, now, taskId);
 }
 
 // ───────────────────────────── Записи ─────────────────────────────
 
-async function assertNoManualOverlap(
-  db: D1Database,
-  projectId: string,
-  start: number,
-  stop: number,
-  now: number,
-  excludeId?: string,
-) {
-  const clash = await db
+async function assertNoManualOverlap(s: Scope, projectId: string, start: number, stop: number, now: number, excludeId?: string) {
+  const clash = await s.db
     .prepare(
       `SELECT id FROM time_entries
-       WHERE project_id = ? AND session_id = ? AND id != ?
+       WHERE user_id = ? AND project_id = ? AND session_id = ? AND id != ?
          AND started_at < ? AND COALESCE(stopped_at, ?) > ?
        LIMIT 1`,
     )
-    .bind(projectId, MANUAL, excludeId ?? '', stop, now, start)
+    .bind(s.uid, projectId, MANUAL, excludeId ?? '', stop, now, start)
     .first();
   if (clash) throw new TimerError('Ручні записи одного проєкту не можуть перекриватися', 409);
 }
 
 export async function createEntry(
-  db: D1Database,
+  s: Scope,
   input: { project_id: string; task_id?: string | null; start: number; stop?: number; duration_ms?: number; note?: string | null },
   now: number,
 ): Promise<Entry> {
-  await getProject(db, input.project_id);
-  const task = await checkTaskInProject(db, input.task_id, input.project_id, now);
+  await getProject(s, input.project_id);
+  const task = await checkTaskInProject(s, input.task_id, input.project_id, now);
   const start = input.start;
   const stop = input.stop ?? (input.duration_ms !== undefined ? start + input.duration_ms : undefined);
   if (stop === undefined) throw new TimerError('Потрібен stop або duration_ms');
   if (!(start < stop)) throw new TimerError('Початок має бути раніше за кінець');
   if (stop - start < MIN_MANUAL_MS) throw new TimerError('Ручний запис має тривати щонайменше хвилину');
   if (stop > now) throw new TimerError('Кінець не може бути в майбутньому');
-  await assertNoManualOverlap(db, input.project_id, start, stop, now);
+  await assertNoManualOverlap(s, input.project_id, start, stop, now);
+  await assertEntryQuota(s, now);
   const id = uid();
-  await db
+  await s.db
     .prepare(
-      'INSERT INTO time_entries (id, project_id, task_id, session_id, source, started_at, stopped_at, last_seen_at, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO time_entries (id, user_id, project_id, task_id, session_id, source, started_at, stopped_at, last_seen_at, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     )
-    .bind(id, input.project_id, task?.id ?? null, MANUAL, 'manual', start, stop, stop, summarize(input.note, 500))
+    .bind(id, s.uid, input.project_id, task?.id ?? null, MANUAL, 'manual', start, stop, stop, summarize(input.note, 500))
     .run();
-  return getEntry(db, id);
+  return getEntry(s, id);
 }
 
-export async function getEntry(db: D1Database, id: string): Promise<Entry> {
-  const e = await db.prepare('SELECT * FROM time_entries WHERE id = ?').bind(id).first<Entry>();
+const ENTRY_COLS = 'id, project_id, task_id, session_id, source, started_at, stopped_at, last_seen_at, note';
+
+export async function getEntry(s: Scope, id: string): Promise<Entry> {
+  const e = await s.db.prepare(`SELECT ${ENTRY_COLS} FROM time_entries WHERE id = ? AND user_id = ?`).bind(id, s.uid).first<Entry>();
   if (!e) throw new TimerError(`Запис ${id} не знайдено`, 404);
   return e;
 }
@@ -979,12 +1147,12 @@ export async function getEntry(db: D1Database, id: string): Promise<Entry> {
  * task_id: null — відв'язати від задачі; undefined — не чіпати.
  */
 export async function updateEntry(
-  db: D1Database,
+  s: Scope,
   id: string,
   patch: { start?: number; stop?: number; duration_ms?: number; note?: string | null; project_id?: string; task_id?: string | null },
   now: number,
 ): Promise<Entry> {
-  const e = await getEntry(db, id);
+  const e = await getEntry(s, id);
   const start = patch.start ?? e.started_at;
   let stop = e.stopped_at;
   if (patch.stop !== undefined) stop = patch.stop;
@@ -995,62 +1163,66 @@ export async function updateEntry(
   if (stop !== null && !(start < stop)) throw new TimerError('Початок має бути раніше за кінець');
   if ((stop ?? start) > now) throw new TimerError('Час не може бути в майбутньому');
   const projectId = patch.project_id ?? e.project_id;
-  if (patch.project_id) await getProject(db, patch.project_id);
+  if (patch.project_id) await getProject(s, patch.project_id);
   let taskId = patch.task_id === undefined ? e.task_id : patch.task_id;
   // Запис переїхав в інший проєкт — стара задача йому вже не пасує.
   if (patch.project_id && patch.project_id !== e.project_id && patch.task_id === undefined) taskId = null;
-  await checkTaskInProject(db, taskId, projectId, now);
+  await checkTaskInProject(s, taskId, projectId, now);
   if (e.session_id === MANUAL) {
     if (stop !== null && stop - start < MIN_MANUAL_MS) throw new TimerError('Ручний запис має тривати щонайменше хвилину');
-    await assertNoManualOverlap(db, projectId, start, stop ?? now, now, id);
+    await assertNoManualOverlap(s, projectId, start, stop ?? now, now, id);
   }
   const note = patch.note === undefined ? e.note : summarize(patch.note, 500);
   try {
-    await db
-      .prepare('UPDATE time_entries SET started_at = ?, stopped_at = ?, last_seen_at = ?, note = ?, project_id = ?, task_id = ? WHERE id = ?')
-      .bind(start, stop, Math.max(e.last_seen_at, stop ?? start), note, projectId, taskId, id)
+    await s.db
+      .prepare('UPDATE time_entries SET started_at = ?, stopped_at = ?, last_seen_at = ?, note = ?, project_id = ?, task_id = ? WHERE id = ? AND user_id = ?')
+      .bind(start, stop, Math.max(e.last_seen_at, stop ?? start), note, projectId, taskId, id, s.uid)
       .run();
   } catch (err) {
     if (String(err).includes('UNIQUE')) throw new TimerError('У цьому проєкті вже йде такий таймер', 409);
     throw err;
   }
-  return getEntry(db, id);
+  return getEntry(s, id);
 }
 
-export async function deleteEntry(db: D1Database, id: string): Promise<void> {
-  await getEntry(db, id);
-  await db.prepare('DELETE FROM time_entries WHERE id = ?').bind(id).run();
+export async function deleteEntry(s: Scope, id: string): Promise<void> {
+  await getEntry(s, id);
+  await s.db.prepare('DELETE FROM time_entries WHERE id = ? AND user_id = ?').bind(id, s.uid).run();
 }
 
-const ENTRY_WITH_PROJECT = `SELECT e.*, p.name AS project_name, p.color AS project_color, t.title AS task_title, t.external_ref AS task_ref
-  FROM time_entries e JOIN projects p ON p.id = e.project_id LEFT JOIN tasks t ON t.id = e.task_id`;
+/** ?1 = user_id. */
+const ENTRY_WITH_PROJECT = `SELECT e.id, e.project_id, e.task_id, e.session_id, e.source, e.started_at, e.stopped_at, e.last_seen_at, e.note,
+    p.name AS project_name, p.color AS project_color, t.title AS task_title, t.external_ref AS task_ref
+  FROM time_entries e JOIN projects p ON p.id = e.project_id AND p.user_id = ?1
+  LEFT JOIN tasks t ON t.id = e.task_id AND t.user_id = ?1
+  WHERE e.user_id = ?1`;
 
 export const ENTRIES_LIMIT = 1000;
 
 /** Записи, що перетинають [from, to), найновіші першими. truncated = є ще старіші за ліміт. */
 export async function listEntries(
-  db: D1Database,
+  s: Scope,
   from: number,
   to: number,
   filter: { projectId?: string; taskId?: string } = {},
   limit = ENTRIES_LIMIT,
 ): Promise<{ entries: EntryWithProject[]; truncated: boolean }> {
   const cond: string[] = [];
-  const args: unknown[] = [to, from];
+  const args: unknown[] = [s.uid, to, from];
   if (filter.projectId) {
-    cond.push('e.project_id = ?');
     args.push(filter.projectId);
+    cond.push(`e.project_id = ?${args.length}`);
   }
   if (filter.taskId) {
-    cond.push('e.task_id = ?');
     args.push(filter.taskId);
+    cond.push(`e.task_id = ?${args.length}`);
   }
   args.push(limit + 1);
   const rows = (
-    await db
+    await s.db
       .prepare(
-        `${ENTRY_WITH_PROJECT} WHERE e.started_at < ? AND (e.stopped_at IS NULL OR e.stopped_at > ?)${cond.map((c) => ` AND ${c}`).join('')}
-         ORDER BY e.started_at DESC LIMIT ?`,
+        `${ENTRY_WITH_PROJECT} AND e.started_at < ?2 AND (e.stopped_at IS NULL OR e.stopped_at > ?3)${cond.map((c) => ` AND ${c}`).join('')}
+         ORDER BY e.started_at DESC LIMIT ?${args.length}`,
       )
       .bind(...args)
       .all<EntryWithProject>()
@@ -1058,23 +1230,23 @@ export async function listEntries(
   return { entries: rows.slice(0, limit), truncated: rows.length > limit };
 }
 
-export async function listRunning(db: D1Database): Promise<EntryWithProject[]> {
-  return (await db.prepare(`${ENTRY_WITH_PROJECT} WHERE e.stopped_at IS NULL ORDER BY e.started_at`).all<EntryWithProject>()).results;
+export async function listRunning(s: Scope): Promise<EntryWithProject[]> {
+  return (await s.db.prepare(`${ENTRY_WITH_PROJECT} AND e.stopped_at IS NULL ORDER BY e.started_at`).bind(s.uid).all<EntryWithProject>()).results;
 }
 
 /** Підписати запущений запис агента в проєкті (MCP timer_label). */
-export async function labelRunning(db: D1Database, cwd: string, note: string, now: number): Promise<number> {
-  const project = await findProjectByPath(db, cwd);
+export async function labelRunning(s: Scope, cwd: string, note: string, now: number): Promise<number> {
+  const project = await findProjectByPath(s, cwd);
   if (!project) {
     throw new TimerError(`Для ${cwd} немає проєкту — агент тут ще не стартував або шлях не прив'язаний (timer_projects add_path)`, 404);
   }
-  const res = await db
+  const res = await s.db
     .prepare(
-      `UPDATE time_entries SET note = ?, last_seen_at = ?
-       WHERE id = (SELECT id FROM time_entries WHERE project_id = ? AND source = 'claude_code' AND stopped_at IS NULL
+      `UPDATE time_entries SET note = ?1, last_seen_at = ?2
+       WHERE user_id = ?3 AND id = (SELECT id FROM time_entries WHERE user_id = ?3 AND project_id = ?4 AND source = 'claude_code' AND stopped_at IS NULL
                    ORDER BY last_seen_at DESC LIMIT 1)`,
     )
-    .bind(summarize(note, 500), now, project.id)
+    .bind(summarize(note, 500), now, s.uid, project.id)
     .run();
   return res.meta.changes ?? 0;
 }
@@ -1119,20 +1291,24 @@ export interface Report {
   days: { date: string; wall_ms: number; sum_full_ms: number; projects: Record<string, number> }[];
 }
 
+/** Найдовший звіт: рік — щоб один запит не перебирав усю історію. */
+const MAX_REPORT_MS = 400 * 24 * 3600_000;
+
 export async function report(
-  db: D1Database,
+  s: Scope,
   q: { from: number; to: number; mode: Mode; tz: string; projectId?: string },
   now: number,
 ): Promise<Report> {
   if (!(q.from < q.to)) throw new TimerError('from має бути раніше за to');
+  if (q.to - q.from > MAX_REPORT_MS) throw new TimerError('Звіт — щонайбільше за рік');
   const to = Math.min(q.to, Math.max(now, q.from + 1));
   const entries = (
-    await db
+    await s.db
       .prepare(
         `SELECT project_id, task_id, started_at, stopped_at FROM time_entries
-         WHERE started_at < ? AND (stopped_at IS NULL OR stopped_at > ?)${q.projectId ? ' AND project_id = ?' : ''}`,
+         WHERE user_id = ? AND started_at < ? AND (stopped_at IS NULL OR stopped_at > ?)${q.projectId ? ' AND project_id = ?' : ''}`,
       )
-      .bind(...(q.projectId ? [to, q.from, q.projectId] : [to, q.from]))
+      .bind(...(q.projectId ? [s.uid, to, q.from, q.projectId] : [s.uid, to, q.from]))
       .all<{ project_id: string; task_id: string | null; started_at: number; stopped_at: number | null }>()
   ).results;
   const intervals = entries.map((e) => ({ taskId: e.project_id, start: e.started_at, stop: e.stopped_at }));
@@ -1140,13 +1316,13 @@ export async function report(
   const focus =
     q.mode === 'focus'
       ? (
-          await db
+          await s.db
             .prepare(
               `SELECT at, project_id FROM focus_switches
-               WHERE at < ? AND at >= COALESCE((SELECT MAX(at) FROM focus_switches WHERE at <= ?), 0)
+               WHERE user_id = ?1 AND at < ?2 AND at >= COALESCE((SELECT MAX(at) FROM focus_switches WHERE user_id = ?1 AND at <= ?3), 0)
                ORDER BY at`,
             )
-            .bind(to, q.from)
+            .bind(s.uid, to, q.from)
             .all<{ at: number; project_id: string | null }>()
         ).results.map((f) => ({ at: f.at, taskId: f.project_id }))
       : [];
@@ -1155,7 +1331,7 @@ export async function report(
   const full = q.mode === 'full' ? main : allocate(intervals, q.from, to, now, 'full');
   const sumFull = Object.values(full.perTask).reduce((a, b) => a + b, 0);
 
-  const projects = new Map((await listProjects(db, true)).map((p) => [p.id, p]));
+  const projects = new Map((await listProjects(s, true)).map((p) => [p.id, p]));
   const rows: ReportRow[] = Object.entries(main.perTask)
     .map(([project_id, ms]) => ({ project_id, ms, name: projects.get(project_id)?.name ?? '?', color: projects.get(project_id)?.color ?? null }))
     .sort((a, b) => b.ms - a.ms);
@@ -1165,7 +1341,7 @@ export async function report(
   const taskTimes = allocate(taskIntervals, q.from, to, now, 'full').perTask;
   const taskIds = Object.keys(taskTimes);
   const taskInfo = new Map<string, TaskWithTime>();
-  for (const t of await listTasks(db, { status: 'all' }, now)) if (taskTimes[t.id] !== undefined) taskInfo.set(t.id, t);
+  for (const t of await listTasks(s, { status: 'all' }, now)) if (taskTimes[t.id] !== undefined) taskInfo.set(t.id, t);
   const tasks: ReportTaskRow[] = taskIds
     .filter((id) => taskInfo.has(id))
     .map((id) => {
@@ -1177,10 +1353,10 @@ export async function report(
 
   const days = dayRanges(q.from, q.to, q.tz).map((d) => {
     if (d.start >= to) return { date: d.date, wall_ms: 0, sum_full_ms: 0, projects: {} };
-    const s = Math.max(d.start, q.from);
+    const st = Math.max(d.start, q.from);
     const e = Math.min(d.end, to);
-    const a = allocate(intervals, s, e, now, q.mode, focus);
-    const f = q.mode === 'full' ? a : allocate(intervals, s, e, now, 'full');
+    const a = allocate(intervals, st, e, now, q.mode, focus);
+    const f = q.mode === 'full' ? a : allocate(intervals, st, e, now, 'full');
     return { date: d.date, wall_ms: a.wall, sum_full_ms: Object.values(f.perTask).reduce((x, y) => x + y, 0), projects: a.perTask };
   });
   const daysWith = days.filter((d) => d.wall_ms > 0).length;

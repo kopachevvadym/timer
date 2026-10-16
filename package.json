@@ -15,6 +15,7 @@
     "smoke": "bash scripts/smoke.sh"
   },
   "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.3",
     "@modelcontextprotocol/server": "2.3.1",
     "agents": "^0.28.1",
     "hono": "^4.13.13",

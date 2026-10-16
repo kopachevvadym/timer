@@ -25,6 +25,9 @@ import {
   listTasks,
   listWaiting,
   mergeProjects,
+  isMcpSession,
+  startMcpTimer,
+  touchMcpTimers,
   removeProjectPath,
   report,
   resolveProject,
@@ -36,6 +39,7 @@ import {
   updateProject,
   updateTask,
   type Project,
+  type Scope,
   type TaskWithTime,
 } from './service';
 import { PERIODS, hm, parseInstant, periodRange, type Period } from './time';
@@ -80,6 +84,9 @@ function fmtTime(ms: number, tz: string): string {
   }).format(new Date(ms));
 }
 
+/** Короткий id сесії Claude Code без префікса користувача. */
+const rawSession = (id: string) => id.slice(id.indexOf(':') + 1, id.indexOf(':') + 9);
+
 const STATUS_UA = { todo: 'до роботи', doing: 'в роботі', done: 'готово' } as const;
 
 function taskLine(t: TaskWithTime, withProject = false): string {
@@ -88,7 +95,7 @@ function taskLine(t: TaskWithTime, withProject = false): string {
   return `- [${STATUS_UA[t.status]}] ${ref}${t.title}${withProject ? ` (${t.project_name})` : ''} · ${hm(t.spent_ms)} · id ${t.id}${live}`;
 }
 
-async function requireProject(db: D1Database, ref: string): Promise<Project> {
+async function requireProject(db: Scope, ref: string): Promise<Project> {
   const p = await findProjectByRef(db, ref);
   if (!p) throw new TimerError(`Проєкт «${ref}» не знайдено. Подивіться список: timer_projects action=list`);
   return p;
@@ -96,7 +103,7 @@ async function requireProject(db: D1Database, ref: string): Promise<Project> {
 
 /** Проєкт з project або cwd. create=true — створити за cwd, як це робить хук. */
 async function projectFrom(
-  db: D1Database,
+  db: Scope,
   args: { project?: string; cwd?: string },
   now: number,
   create = false,
@@ -110,7 +117,7 @@ async function projectFrom(
   throw new TimerError('Вкажіть cwd (вашу робочу директорію) або project');
 }
 
-async function requireTask(db: D1Database, ref: string, projectId: string | null, now: number): Promise<TaskWithTime> {
+async function requireTask(db: Scope, ref: string, projectId: string | null, now: number): Promise<TaskWithTime> {
   const t = await findTaskByRef(db, ref, projectId, now);
   if (!t) throw new TimerError(`Задачу «${ref}» не знайдено. Подивіться список: timer_task_list`);
   return t;
@@ -130,14 +137,20 @@ function range(
   return { ...periodRange(period, now, tz), label: period };
 }
 
-export function buildServer(env: Env): McpServer {
-  const db = env.DB;
-  const tz = env.TIMEZONE || 'Europe/Kyiv';
+export interface McpUser {
+  id: string;
+  timezone: string;
+}
+
+export function buildServer(env: Env, user: McpUser): McpServer {
+  // Усе, що бачить цей MCP-сервер, — дані одного користувача (з OAuth-токена або API-ключа).
+  const db: Scope = { db: env.DB, uid: user.id };
+  const tz = user.timezone || 'Europe/Kyiv';
   const server = new McpServer(
     { name: 'timer', version: '0.2.0' },
     {
       instructions:
-        'Трекер часу агентів. Час пишеться автоматично хуками. Коли починаєте конкретну задачу в проєкті — викличте timer_task_start (або timer_task_add з start=true для нової), коли закінчили — timer_task_done. Завжди передавайте cwd = вашу робочу директорію.',
+        'Трекер часу агентів. Коли починаєте конкретну задачу — викличте timer_task_start (або timer_task_add з start=true для нової), коли закінчили — обов’язково timer_task_done: без хуків Claude Code (claude.ai, Claude Desktop, хмарні сесії) час задачі рахується саме від старту до done. Завжди передавайте cwd = вашу робочу директорію, якщо вона є.',
     },
   );
 
@@ -161,13 +174,13 @@ export function buildServer(env: Env): McpServer {
           lines.push(`Чекають на людину: ${waiting.length}`);
           for (const w of waiting) {
             const what = w.task_title ? `${w.task_ref ? `${w.task_ref} ` : ''}${w.task_title}` : (w.last_prompt ?? '');
-            lines.push(`- ${w.project_name} (агент ${w.session_id.slice(0, 8)}): ${hm(now - w.waiting_since)}${w.waiting_reason ? ` — ${w.waiting_reason}` : ''}${what ? ` · ${what}` : ''}`);
+            lines.push(`- ${w.project_name} (агент ${rawSession(w.session_id)}): ${hm(now - w.waiting_since)}${w.waiting_reason ? ` — ${w.waiting_reason}` : ''}${what ? ` · ${what}` : ''}`);
           }
         }
         if (running.length) {
           lines.push(`Працюють: ${running.length}`);
           for (const r of running) {
-            const who = r.source === 'claude_code' ? `агент ${r.session_id.slice(0, 8)}` : 'вручну';
+            const who = r.source !== 'claude_code' ? 'вручну' : isMcpSession(r.session_id) ? 'задача через MCP' : `агент ${rawSession(r.session_id)}`;
             const task = r.task_title ? ` → ${r.task_title}` : '';
             lines.push(`- ${r.project_name}${task} (${who}): ${hm(now - r.started_at)} з ${fmtTime(r.started_at, tz)}${r.note ? ` — ${r.note}` : ''}`);
           }
@@ -264,7 +277,8 @@ export function buildServer(env: Env): McpServer {
         const t = await createTask(db, { project_id: p.id, title: args.title, notes: args.notes, external_ref: args.external_ref }, now);
         if (!args.start) return ok(`Додано в «${p.name}»: ${t.title} (id ${t.id}).`, t);
         const res = await startTask(db, t.id, now);
-        return ok(`Додано й почато в «${p.name}»: ${t.title} (id ${t.id}). ${bindNote(res.bound)}`, res.task);
+        const timer = await startMcpTimer(db, res.task, now);
+        return ok(`Додано й почато в «${p.name}»: ${t.title} (id ${t.id}). ${bindNote(timer)}`, res.task);
       }),
   );
 
@@ -273,7 +287,7 @@ export function buildServer(env: Env): McpServer {
     {
       title: 'Почати задачу',
       description:
-        'Викличте, коли починаєте працювати над задачею: статус «в роботі», і час вашої сесії відтепер іде в неї (до timer_task_done або старту іншої задачі). Задача — id, номер у трекері або назва.',
+        'Викличте, коли починаєте працювати над задачею: статус «в роботі», і відтепер час іде в неї до timer_task_done. Кілька задач можуть іти паралельно. Задача — id, номер у трекері або назва.',
       inputSchema: z.object({
         task: z.string().min(1),
         cwd: z.string().optional().describe(CWD_HINT),
@@ -286,7 +300,8 @@ export function buildServer(env: Env): McpServer {
         const p = args.project || args.cwd ? await projectFrom(db, args, now) : null;
         const t = await requireTask(db, args.task, p?.id ?? null, now);
         const res = await startTask(db, t.id, now);
-        return ok(`В роботі: ${t.title} (${t.project_name}). ${bindNote(res.bound)}`, res.task);
+        const timer = await startMcpTimer(db, res.task, now);
+        return ok(`В роботі: ${t.title} (${t.project_name}). ${bindNote(timer)}`, res.task);
       }),
   );
 
@@ -294,7 +309,7 @@ export function buildServer(env: Env): McpServer {
     'timer_task_done',
     {
       title: 'Завершити задачу',
-      description: 'Позначити задачу виконаною. Час далі йде в проєкт без задачі. Задача — id, номер у трекері або назва.',
+      description: 'Позначити задачу виконаною й зупинити її таймер (сесія з хуками далі рахується в проєкт без задачі). Задача — id, номер у трекері або назва.',
       inputSchema: z.object({
         task: z.string().min(1),
         cwd: z.string().optional().describe(CWD_HINT),
@@ -587,12 +602,14 @@ export function buildServer(env: Env): McpServer {
   return server;
 }
 
-function bindNote(bound: boolean): string {
-  return bound
-    ? 'Час сесії агента тепер іде в цю задачу.'
-    : 'Час вашої сесії піде в цю задачу одразу після цього виклику (його прив’язує хук трекера).';
+function bindNote(timerStarted: boolean): string {
+  return timerStarted
+    ? 'Таймер задачі пішов; зупиниться на timer_task_done (якщо у вас є хуки Claude Code — час рахуватиме ваша сесія).'
+    : 'Час у цю задачу вже йде.';
 }
 
-export function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  return createMcpHandler(() => buildServer(env), { route: '/mcp' })(request, env, ctx);
+export function handleMcp(request: Request, env: Env, ctx: ExecutionContext, user: McpUser): Promise<Response> {
+  // Кожен запит MCP продовжує таймери задач цього користувача (у клієнтів без хуків іншого «пульсу» немає).
+  ctx.waitUntil(touchMcpTimers({ db: env.DB, uid: user.id }, Date.now()).catch(() => {}));
+  return createMcpHandler(() => buildServer(env, user), { route: '/mcp' })(request, env, ctx);
 }
