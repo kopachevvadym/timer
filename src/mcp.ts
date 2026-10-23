@@ -28,6 +28,10 @@ import {
   isMcpSession,
   startMcpTimer,
   touchMcpTimers,
+  normalizeRepo,
+  isEphemeralPath,
+  findProjectByRepo,
+  setProjectRepo,
   removeProjectPath,
   report,
   resolveProject,
@@ -49,7 +53,9 @@ const MODES = ['full', 'split', 'focus'] as const;
 const TIME_HINT =
   'ISO 8601 зі зсувом (2026-10-14T10:00:00+03:00) або локальний час без зсуву (2026-10-14 10:00) — тоді в поясі трекера.';
 const CWD_HINT = 'Ваша робоча директорія (абсолютний шлях). За нею трекер знаходить проєкт. Замість cwd можна передати project.';
-const PROJECT_HINT = 'Назва або id проєкту. Якщо не задано — проєкт визначається за cwd.';
+const PROJECT_HINT = 'Назва або id проєкту. Якщо не задано — проєкт визначається за repo або cwd.';
+const REPO_HINT =
+  'Репозиторій: вивід `git remote get-url origin` або owner/name. Передавайте завжди, коли працюєте в git: за ним проєкт знаходиться з будь-якої папки чи клону (хмарні сесії).';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; structuredContent?: Record<string, unknown>; isError?: boolean };
 
@@ -101,25 +107,74 @@ async function requireProject(db: Scope, ref: string): Promise<Project> {
   return p;
 }
 
-/** Проєкт з project або cwd. create=true — створити за cwd, як це робить хук. */
-async function projectFrom(
-  db: Scope,
-  args: { project?: string; cwd?: string },
-  now: number,
-  create = false,
-): Promise<Project> {
-  if (args.project) return requireProject(db, args.project);
-  if (args.cwd) {
-    const p = create ? await resolveProject(db, args.cwd, now) : await findProjectByPath(db, args.cwd);
-    if (p) return p;
-    throw new TimerError(`Для ${args.cwd} проєкту ще немає. Передайте project або прив'яжіть шлях: timer_projects add_path`);
+type Where = { project?: string; cwd?: string; repo?: string };
+
+/**
+ * Проєкт за project → repo → cwd. create=true — створити за cwd, як це робить хук.
+ * Хмарні сесії клонують репозиторій у тимчасові папки з різними назвами (/home/claude/alee-1718),
+ * тож для них проєкт визначає repo, а не папка: інакше кожен клон ставав окремим проєктом.
+ */
+async function projectFrom(db: Scope, args: Where, now: number, create = false): Promise<Project> {
+  const p = await locateProject(db, args, now, create);
+  await touchMcpTimers(db, now, p.id);
+  return p;
+}
+
+async function locateProject(db: Scope, args: Where, now: number, create: boolean): Promise<Project> {
+  const repo = args.repo ? normalizeRepo(args.repo) : null;
+  if (args.repo && !repo) throw new TimerError('repo: очікується owner/name або URL з git remote get-url origin');
+  if (args.project) {
+    const p = await requireProject(db, args.project);
+    if (repo && !p.repo && !(await findProjectByRepo(db, repo))) return setProjectRepo(db, p.id, repo);
+    return p;
   }
-  throw new TimerError('Вкажіть cwd (вашу робочу директорію) або project');
+  if (repo) {
+    const byRepo = await findProjectByRepo(db, repo);
+    if (byRepo) {
+      // Постійна папка на диску, ще ні до чого не прив'язана, — запам'ятовуємо: хуки знайдуть проєкт за нею.
+      if (args.cwd && !isEphemeralPath(args.cwd) && !(await findProjectByPath(db, args.cwd))) {
+        await addProjectPath(db, byRepo.id, args.cwd).catch(() => null);
+      }
+      return byRepo;
+    }
+  }
+  if (args.cwd) {
+    const byPath = await findProjectByPath(db, args.cwd);
+    if (byPath) return repo && !byPath.repo ? setProjectRepo(db, byPath.id, repo) : byPath;
+    if (isEphemeralPath(args.cwd)) {
+      // Тимчасова папка: за нею проєкт не створюємо — нехай агент назве проєкт або репозиторій.
+      if (create && repo) {
+        const name = repo.split('/').pop() ?? 'project';
+        const existing = await findProjectByRef(db, name);
+        const p = existing && !existing.repo ? existing : await createProject(db, { name: await freeName(db, name) }, now);
+        return setProjectRepo(db, p.id, repo);
+      }
+      const names = (await listProjects(db)).map((x) => x.name).slice(0, 30);
+      throw new TimerError(
+        `${args.cwd} — тимчасова папка (хмарна сесія), за нею проєкт не визначити. Передайте repo (git remote get-url origin) або project${names.length ? ` — один із: ${names.join(', ')}` : ''}.`,
+      );
+    }
+    if (create) {
+      const p = await resolveProject(db, args.cwd, now);
+      return repo && !p.repo ? setProjectRepo(db, p.id, repo) : p;
+    }
+    throw new TimerError(`Для ${args.cwd} проєкту ще немає. Передайте project або repo, або прив'яжіть шлях: timer_projects add_path`);
+  }
+  throw new TimerError('Вкажіть repo (git remote get-url origin), cwd (вашу робочу директорію) або project');
+}
+
+/** Назва без конфлікту: «name», «name (2)»… */
+async function freeName(db: Scope, base: string): Promise<string> {
+  const taken = new Set((await listProjects(db, true)).map((p) => p.name.toLowerCase()));
+  let name = base;
+  for (let i = 2; taken.has(name.toLowerCase()); i++) name = `${base} (${i})`;
+  return name;
 }
 
 async function requireTask(db: Scope, ref: string, projectId: string | null, now: number): Promise<TaskWithTime> {
   const t = await findTaskByRef(db, ref, projectId, now);
   if (!t) throw new TimerError(`Задачу «${ref}» не знайдено. Подивіться список: timer_task_list`);
+  await touchMcpTimers(db, now, t.project_id);
   return t;
 }
 
@@ -150,7 +205,7 @@ export function buildServer(env: Env, user: McpUser): McpServer {
     { name: 'timer', version: '0.2.0' },
     {
       instructions:
-        'Трекер часу агентів. Коли починаєте конкретну задачу — викличте timer_task_start (або timer_task_add з start=true для нової), коли закінчили — обов’язково timer_task_done: без хуків Claude Code (claude.ai, Claude Desktop, хмарні сесії) час задачі рахується саме від старту до done. Завжди передавайте cwd = вашу робочу директорію, якщо вона є.',
+        'Трекер часу агентів. Коли починаєте конкретну задачу — викличте timer_task_start (або timer_task_add з start=true для нової), коли закінчили — обов’язково timer_task_done: без хуків Claude Code (claude.ai, Claude Desktop, хмарні сесії) час задачі рахується саме від старту до done. Задача без старту отримує 0 хв. У кожному виклику передавайте repo (git remote get-url origin), якщо працюєте в git-репозиторії, і cwd — вашу робочу директорію: у хмарних сесіях папка тимчасова, і проєкт визначає саме repo.',
     },
   );
 
@@ -241,6 +296,7 @@ export function buildServer(env: Env, user: McpUser): McpServer {
       description: 'Задачі проєкту з витраченим часом. Без project і cwd — задачі всіх проєктів.',
       inputSchema: z.object({
         cwd: z.string().optional().describe(CWD_HINT),
+        repo: z.string().optional().describe(REPO_HINT),
         project: z.string().optional().describe(PROJECT_HINT),
         status: z.enum(['open', 'done', 'all']).optional().describe('open (типово) = до роботи + в роботі'),
       }),
@@ -248,7 +304,7 @@ export function buildServer(env: Env, user: McpUser): McpServer {
     async (args) =>
       guard(async () => {
         const now = Date.now();
-        const p = args.project || args.cwd ? await projectFrom(db, args, now) : null;
+        const p = args.project || args.cwd || args.repo ? await projectFrom(db, args, now) : null;
         const tasks = await listTasks(db, { projectId: p?.id, status: args.status ?? 'open' }, now);
         if (tasks.length === 0) return ok(p ? `У «${p.name}» задач немає.` : 'Задач немає.', []);
         return ok(`${p ? `«${p.name}»` : 'Усі проєкти'}:\n${tasks.map((t) => taskLine(t, !p)).join('\n')}`, tasks);
@@ -260,10 +316,11 @@ export function buildServer(env: Env, user: McpUser): McpServer {
     {
       title: 'Додати задачу',
       description:
-        'Нова задача в проєкті. start=true — одразу почати її: час вашої сесії піде в цю задачу. Проєкт за cwd створюється, якщо його ще немає.',
+        'Нова задача в проєкті. start=true — одразу почати її: таймер задачі піде до timer_task_done. Проєкт за cwd створюється, якщо його ще немає.',
       inputSchema: z.object({
         title: z.string().min(1).describe('Коротко, що треба зробити'),
         cwd: z.string().optional().describe(CWD_HINT),
+        repo: z.string().optional().describe(REPO_HINT),
         project: z.string().optional().describe(PROJECT_HINT),
         notes: z.string().optional(),
         external_ref: z.string().optional().describe('Номер у трекері: LIN-42, #128'),
@@ -291,13 +348,14 @@ export function buildServer(env: Env, user: McpUser): McpServer {
       inputSchema: z.object({
         task: z.string().min(1),
         cwd: z.string().optional().describe(CWD_HINT),
+        repo: z.string().optional().describe(REPO_HINT),
         project: z.string().optional().describe(PROJECT_HINT),
       }),
     },
     async (args) =>
       guard(async () => {
         const now = Date.now();
-        const p = args.project || args.cwd ? await projectFrom(db, args, now) : null;
+        const p = args.project || args.cwd || args.repo ? await projectFrom(db, args, now) : null;
         const t = await requireTask(db, args.task, p?.id ?? null, now);
         const res = await startTask(db, t.id, now);
         const timer = await startMcpTimer(db, res.task, now);
@@ -313,16 +371,18 @@ export function buildServer(env: Env, user: McpUser): McpServer {
       inputSchema: z.object({
         task: z.string().min(1),
         cwd: z.string().optional().describe(CWD_HINT),
+        repo: z.string().optional().describe(REPO_HINT),
         project: z.string().optional().describe(PROJECT_HINT),
       }),
     },
     async (args) =>
       guard(async () => {
         const now = Date.now();
-        const p = args.project || args.cwd ? await projectFrom(db, args, now) : null;
+        const p = args.project || args.cwd || args.repo ? await projectFrom(db, args, now) : null;
         const t = await requireTask(db, args.task, p?.id ?? null, now);
         const done = await updateTask(db, t.id, { status: 'done' }, now);
-        return ok(`Готово: ${done.title} (${done.project_name}) · витрачено ${hm(done.spent_ms)}.`, done);
+        const zero = done.spent_ms < 60_000 ? ' Часу майже не записано — наступного разу викличте timer_task_start на початку роботи (або timer_task_add з start=true).' : '';
+        return ok(`Готово: ${done.title} (${done.project_name}) · витрачено ${hm(done.spent_ms)}.${zero}`, done);
       }),
   );
 
@@ -334,6 +394,7 @@ export function buildServer(env: Env, user: McpUser): McpServer {
       inputSchema: z.object({
         task: z.string().min(1).describe('id, номер у трекері або назва'),
         cwd: z.string().optional().describe(CWD_HINT),
+        repo: z.string().optional().describe(REPO_HINT),
         project: z.string().optional().describe(PROJECT_HINT),
         title: z.string().optional(),
         notes: z.string().optional(),
@@ -345,7 +406,7 @@ export function buildServer(env: Env, user: McpUser): McpServer {
     async (args) =>
       guard(async () => {
         const now = Date.now();
-        const p = args.project || args.cwd ? await projectFrom(db, args, now) : null;
+        const p = args.project || args.cwd || args.repo ? await projectFrom(db, args, now) : null;
         const t = await requireTask(db, args.task, p?.id ?? null, now);
         if (args.delete) {
           await deleteTask(db, t.id, now);
@@ -541,10 +602,11 @@ export function buildServer(env: Env, user: McpUser): McpServer {
     {
       title: 'Проєкти',
       description:
-        'list — список; create — новий проєкт (name, path?); rename — project + name; add_path / remove_path — project + path (абсолютний шлях на диску, за яким хуки знаходять проєкт; шляхів може бути кілька); merge — project + into (перенести записи, задачі й шляхи, видалити project); archive / unarchive — project.',
+        'list — список; create — новий проєкт (name, path?); rename — project + name; add_path / remove_path — project + path (абсолютний шлях на диску, за яким хуки знаходять проєкт; шляхів може бути кілька); set_repo — project + repo (git remote; порожній repo відв’язує); merge — project + into (перенести записи, задачі, шляхи й репозиторій, видалити project); archive / unarchive — project.',
       inputSchema: z.object({
-        action: z.enum(['list', 'create', 'rename', 'add_path', 'remove_path', 'merge', 'archive', 'unarchive']),
+        action: z.enum(['list', 'create', 'rename', 'add_path', 'remove_path', 'set_repo', 'merge', 'archive', 'unarchive']),
         project: z.string().optional(),
+        repo: z.string().optional(),
         name: z.string().optional(),
         path: z.string().optional(),
         into: z.string().optional(),
@@ -560,7 +622,7 @@ export function buildServer(env: Env, user: McpUser): McpServer {
             if (projects.length === 0) return ok('Проєктів ще немає. Вони з’являються автоматично, коли агент стартує в новій папці.', []);
             return ok(
               projects
-                .map((p) => `- ${p.name} · ${p.id}${p.paths.length ? ` · ${p.paths.join(', ')}` : ''}${p.archived_at ? ' · архів' : ''}`)
+                .map((p) => `- ${p.name} · ${p.id}${p.repo ? ` · ${p.repo}` : ''}${p.paths.length ? ` · ${p.paths.join(', ')}` : ''}${p.archived_at ? ' · архів' : ''}`)
                 .join('\n'),
               projects,
             );
@@ -581,6 +643,11 @@ export function buildServer(env: Env, user: McpUser): McpServer {
             const id = (await requireProject(db, args.project)).id;
             const p = args.action === 'add_path' ? await addProjectPath(db, id, args.path) : await removeProjectPath(db, id, args.path);
             return ok(`Шляхи «${p.name}»: ${p.paths.length ? p.paths.join(', ') : 'немає'}.`, p);
+          }
+          case 'set_repo': {
+            if (!args.project) throw new TimerError('Потрібен project');
+            const p = await setProjectRepo(db, (await requireProject(db, args.project)).id, args.repo?.trim() ? args.repo : null);
+            return ok(p.repo ? `«${p.name}» ← ${p.repo}.` : `У «${p.name}» репозиторій відв’язано.`, p);
           }
           case 'merge': {
             if (!args.project || !args.into) throw new TimerError('Потрібні project і into');
@@ -609,7 +676,5 @@ function bindNote(timerStarted: boolean): string {
 }
 
 export function handleMcp(request: Request, env: Env, ctx: ExecutionContext, user: McpUser): Promise<Response> {
-  // Кожен запит MCP продовжує таймери задач цього користувача (у клієнтів без хуків іншого «пульсу» немає).
-  ctx.waitUntil(touchMcpTimers({ db: env.DB, uid: user.id }, Date.now()).catch(() => {}));
   return createMcpHandler(() => buildServer(env, user), { route: '/mcp' })(request, env, ctx);
 }

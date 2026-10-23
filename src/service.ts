@@ -33,6 +33,8 @@ export interface Project {
   name: string;
   /** Шляхи проєкту на диску; хук знаходить проєкт за найдовшим префіксом cwd. */
   paths: string[];
+  /** Репозиторій (host/owner/name) — за ним MCP знаходить проєкт із будь-якої папки-клону. */
+  repo: string | null;
   color: string | null;
   created_at: number;
   archived_at: number | null;
@@ -94,6 +96,28 @@ export function normalizePath(p: string): string {
   return t.length > 1 ? t.replace(/\/+$/, '') : t;
 }
 
+/**
+ * Репозиторій до вигляду host/owner/name: git@github.com:o/n.git, https://github.com/o/n, o/n (→ github.com).
+ * null — якщо не схоже на репозиторій.
+ */
+export function normalizeRepo(input: string | null | undefined): string | null {
+  let r = (input ?? '').trim().toLowerCase();
+  if (!r) return null;
+  r = r.replace(/\.git$/, '').replace(/\/+$/, '');
+  const scp = /^[\w.-]+@([\w.-]+):(.+)$/.exec(r); // git@host:owner/name
+  if (scp) r = `${scp[1]}/${scp[2]}`;
+  else r = r.replace(/^[a-z+]+:\/\//, '').replace(/^[^@/]+@/, ''); // https://, ssh://user@
+  const parts = r.split('/').filter(Boolean);
+  if (parts.length === 2) parts.unshift('github.com');
+  if (parts.length < 3 || !parts[0].includes('.') || parts.some((x) => !/^[\w.-]+$/.test(x))) return null;
+  return parts.join('/').slice(0, 200);
+}
+
+/** Тимчасові папки хмарних сесій і /tmp: за такою папкою проєкт не створюємо й шлях не прив'язуємо. */
+export function isEphemeralPath(p: string): boolean {
+  return /^\/(home\/claude|home\/user|root|tmp|private\/tmp|var\/folders|workspace|mnt|sessions)(\/|$)/.test(normalizePath(p));
+}
+
 function basename(p: string): string {
   const parts = normalizePath(p).split('/').filter(Boolean);
   return parts[parts.length - 1] ?? p;
@@ -114,12 +138,13 @@ const lower = (s: string) => s.trim().toLocaleLowerCase('uk');
 interface ProjectRow {
   id: string;
   name: string;
+  repo: string | null;
   color: string | null;
   created_at: number;
   archived_at: number | null;
 }
 
-const PROJECT_COLS = 'id, name, color, created_at, archived_at';
+const PROJECT_COLS = 'id, name, repo, color, created_at, archived_at';
 const COLOR_RE = /^#[0-9a-f]{3,8}$/i;
 /** Обмеження на користувача — щоб один акаунт не з'їв базу. */
 export const LIMITS = {
@@ -217,6 +242,26 @@ export async function findProjectByRef(s: Scope, ref: string): Promise<Project |
   const r = lower(ref);
   const byName = all.filter((p) => lower(p.name) === r);
   return all.find((p) => p.id === ref.trim()) ?? byName.find((p) => p.archived_at === null) ?? byName[0] ?? null;
+}
+
+export async function findProjectByRepo(s: Scope, repo: string): Promise<Project | null> {
+  const r = normalizeRepo(repo);
+  if (!r) return null;
+  const p = await s.db.prepare(`SELECT ${PROJECT_COLS} FROM projects WHERE user_id = ? AND repo = ?`).bind(s.uid, r).first<ProjectRow>();
+  return p ? (await withPaths(s, [p]))[0] : null;
+}
+
+/** Прив'язати репозиторій до проєкту (null — відв'язати). */
+export async function setProjectRepo(s: Scope, id: string, repo: string | null): Promise<Project> {
+  await getProject(s, id);
+  const r = repo === null ? null : normalizeRepo(repo);
+  if (repo !== null && !r) throw new TimerError('repo: очікується owner/name або URL git remote');
+  if (r) {
+    const other = await findProjectByRepo(s, r);
+    if (other && other.id !== id) throw new TimerError(`Репозиторій ${r} уже прив'язаний до «${other.name}» — об'єднайте проєкти (merge)`, 409);
+  }
+  await s.db.prepare('UPDATE projects SET repo = ? WHERE id = ? AND user_id = ?').bind(r, id, s.uid).run();
+  return getProject(s, id);
 }
 
 /** Проєкт, чий шлях — найдовший префікс cwd. */
@@ -355,7 +400,7 @@ export async function mergeProjects(s: Scope, fromId: string, intoId: string, no
   const { db, uid: u } = s;
   if (fromId === intoId) throw new TimerError('Не можна об’єднати проєкт сам із собою');
   // Обидва проєкти мають належати цьому користувачу — інакше 404.
-  await getProject(s, fromId);
+  const fromProject = await getProject(s, fromId);
   await getProject(s, intoId);
   // Ручні записи одного проєкту не перекриваються — перевіряємо до перенесення.
   const clash = await db
@@ -377,6 +422,11 @@ export async function mergeProjects(s: Scope, fromId: string, intoId: string, no
     db.prepare('UPDATE agent_sessions SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
     db.prepare('UPDATE focus_switches SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
     db.prepare('UPDATE project_paths SET project_id = ? WHERE user_id = ? AND project_id = ?').bind(intoId, u, fromId),
+    // Репозиторій переходить до цільового проєкту, якщо в того свого немає (спершу звільняємо унікальний індекс).
+    db.prepare('UPDATE projects SET repo = NULL WHERE id = ?1 AND user_id = ?2 AND (SELECT repo FROM projects WHERE id = ?3 AND user_id = ?2) IS NULL AND repo IS NOT NULL').bind(fromId, u, intoId),
+    db
+      .prepare('UPDATE projects SET repo = ?1 WHERE id = ?2 AND user_id = ?3 AND repo IS NULL AND ?1 IS NOT NULL')
+      .bind(fromProject.repo, intoId, u),
     db.prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').bind(fromId, u),
   ]);
   return getProject(s, intoId);
@@ -507,11 +557,14 @@ export async function startMcpTimer(s: Scope, task: { id: string; project_id: st
   return true;
 }
 
-/** Будь-який виклик MCP — ознака, що агент живий: продовжуємо його таймери задач. */
-export function touchMcpTimers(s: Scope, now: number): Promise<unknown> {
+/**
+ * Виклик MCP про цей проєкт — ознака, що агент у ньому живий: продовжуємо таймери задач лише цього проєкту.
+ * (Раніше продовжували всі — і забуті таймери одних проєктів жили за рахунок агентів інших.)
+ */
+export function touchMcpTimers(s: Scope, now: number, projectId: string): Promise<unknown> {
   return s.db
-    .prepare('UPDATE time_entries SET last_seen_at = ? WHERE user_id = ? AND stopped_at IS NULL AND session_id LIKE ?')
-    .bind(now, s.uid, `${s.uid}:mcp:%`)
+    .prepare('UPDATE time_entries SET last_seen_at = ? WHERE user_id = ? AND project_id = ? AND stopped_at IS NULL AND session_id LIKE ?')
+    .bind(now, s.uid, projectId, `${s.uid}:mcp:%`)
     .run();
 }
 

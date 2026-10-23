@@ -1,0 +1,7 @@
+{
+  "name": "timer-tracking",
+  "version": "0.1.0",
+  "description": "Нагадує агенту запускати таймер timer.kopachev.life перед кожною задачею і зупиняти після",
+  "author": { "name": "kopachevvadym" },
+  "homepage": "https://timer.kopachev.life"
+}

@@ -94,5 +94,43 @@ b = [x for x in running() if x['task_title'] == 'Фіча B'][0]
 st, _ = req('POST', f"/api/sessions/{urllib.parse.quote(b['session_id'])}/stop", {}, C)
 check('веб «Стоп» зупиняє таймер MCP', st == 200 and not [x for x in running() if x['task_title'] == 'Фіча B'])
 
+# 8. Хмарні клони: різні тимчасові папки + той самий repo → один проєкт
+def mcp_err(tool, args):
+    t, e = mcp(tool, args)
+    return t, bool(e)
+t, e = mcp_err('timer_task_add', {'title': 'Клон 1', 'cwd': '/home/claude/gamma-1711', 'start': True})
+check('тимчасова папка без repo → помилка з підказкою', e and 'repo' in t)
+t, e = mcp_err('timer_task_add', {'title': 'Клон 1', 'cwd': '/home/claude/gamma-1711', 'repo': 'git@github.com:Me/Gamma.git', 'start': True})
+t2, e2 = mcp_err('timer_task_add', {'title': 'Клон 2', 'cwd': '/home/claude/gamma-dup', 'repo': 'https://github.com/me/gamma', 'start': True})
+projs = json.loads(req('GET', '/api/projects', None, C)[1])
+g = [p for p in projs if p.get('repo') == 'github.com/me/gamma']
+check('два клони → один проєкт gamma', not e and not e2 and len(g) == 1 and g[0]['name'] == 'gamma' and not g[0]['paths'])
+check('тимчасові папки не стали проєктами', not [p for p in projs if p['name'].startswith('gamma-')])
+# постійна папка з тим самим repo прив'язується до проєкту
+mcp('timer_task_list', {'cwd': '/Users/x/gamma', 'repo': 'me/gamma'})
+projs = json.loads(req('GET', '/api/projects', None, C)[1])
+g = [p for p in projs if p.get('repo') == 'github.com/me/gamma'][0]
+check('постійна папка з repo прив’язалась до проєкту', g['paths'] == ['/Users/x/gamma'])
+# існуючий проєкт без repo + repo з project → прив'язка
+mcp('timer_task_list', {'project': 'Alpha', 'repo': 'me/alpha'})
+projs = json.loads(req('GET', '/api/projects', None, C)[1])
+check('project + repo прив’язує repo до проєкту', [p for p in projs if p['name'] == 'Alpha'][0].get('repo') == 'github.com/me/alpha')
+
+# 9. «Пульс» лише свого проєкту
+mcp('timer_task_add', {'title': 'Фіча E', 'project': 'Alpha', 'start': True})
+before = {x['task_title']: x['last_seen_at'] for x in running()}
+time.sleep(1.1)
+mcp('timer_task_list', {'repo': 'me/gamma'})
+after = {x['task_title']: x['last_seen_at'] for x in running()}
+check('виклик про gamma продовжив таймери gamma', after['Клон 1'] > before['Клон 1'])
+others = [k for k in before if k not in ('Клон 1', 'Клон 2') and k in after]
+check('і не чіпав таймери інших проєктів', 'Фіча E' in others and all(after[k] == before[k] for k in others))
+
+# 10. Злиття переносить repo
+req('POST', '/api/projects', {'name': 'Delta'}, C)
+mcp('timer_projects', {'action': 'merge', 'project': 'gamma', 'into': 'Delta'})
+projs = json.loads(req('GET', '/api/projects', None, C)[1])
+check('merge переніс repo у цільовий проєкт', [p for p in projs if p['name'] == 'Delta'][0].get('repo') == 'github.com/me/gamma')
+
 print('\nПомилок:', fails)
 sys.exit(1 if fails else 0)

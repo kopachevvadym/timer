@@ -1098,6 +1098,7 @@ async function projectDetail(p, today, running) {
     dot(p.id, p.color, running.length ? 'live' : ''),
     el('h1', {}, p.name),
     agents ? el('span', { class: 'chip' }, `${agents} ${agents === 1 ? 'агент працює' : 'агенти працюють'}`) : null,
+    p.repo ? el('span', { class: 'chip mono', title: 'Репозиторій: за ним MCP знаходить проєкт з будь-якої папки чи клону' }, p.repo.replace(/^github\.com\//, '')) : null,
     p.archived_at ? el('span', { class: 'chip' }, 'в архіві') : null,
     el('span', { style: { flex: '1' } }),
     manual
