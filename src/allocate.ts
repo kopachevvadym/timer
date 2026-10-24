@@ -82,3 +82,43 @@ export function allocate(
 
   return { wall, perTask };
 }
+
+export interface Stream {
+  /** Потік роботи: сесія агента, таймер задачі через MCP або ручний таймер проєкту. */
+  key: string;
+  start: number;
+  stop: number | null;
+}
+
+export interface Concurrency {
+  /** Реальний час: коли йшов хоча б один потік, мс. */
+  wall: number;
+  /** Сума часу всіх потоків (п'ять сесій по годині разом = 5 год), мс. */
+  sum: number;
+  /** Найбільше потоків одночасно. */
+  peak: number;
+}
+
+/**
+ * Скільки потоків роботи йшло одночасно — незалежно від того, один це проєкт чи різні.
+ * Кілька записів одного потоку в один момент рахуються один раз. sum / wall — середня паралельність.
+ */
+export function concurrency(streams: Stream[], from: number, to: number, now: number): Concurrency {
+  const iv = streams
+    .map((x) => ({ key: x.key, s: Math.max(x.start, from), e: Math.min(x.stop ?? now, to) }))
+    .filter((x) => x.e > x.s);
+  const points = [...new Set(iv.flatMap((x) => [x.s, x.e]))].sort((a, b) => a - b);
+  let wall = 0;
+  let sum = 0;
+  let peak = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    const k = new Set(iv.filter((x) => x.s <= a && x.e >= b).map((x) => x.key)).size;
+    if (k === 0) continue;
+    wall += b - a;
+    sum += k * (b - a);
+    peak = Math.max(peak, k);
+  }
+  return { wall, sum, peak };
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allocate } from '../src/allocate';
+import { allocate, concurrency } from '../src/allocate';
 
 const M = 60_000;
 const at = (h: number, m = 0) => (h * 60 + m) * M;
@@ -57,5 +57,46 @@ describe('allocate', () => {
 
   it('порожній період', () => {
     expect(allocate([], 0, at(24), at(23), 'split')).toEqual({ wall: 0, perTask: {} });
+  });
+});
+
+describe('concurrency', () => {
+  it('п’ять сесій одного проєкту одночасно — ×5', () => {
+    const five = [1, 2, 3, 4, 5].map((i) => ({ key: `s${i}`, start: at(10), stop: at(11) }));
+    const c = concurrency(five, 0, at(24), at(23));
+    expect(c).toEqual({ wall: 60 * M, sum: 300 * M, peak: 5 });
+    expect(c.sum / c.wall).toBe(5);
+  });
+
+  it('частково перекриті сесії: середнє, а не пік', () => {
+    // A 10:00–11:00, B 10:30–11:30 → реально 90 хв, разом 120 хв, ×1.33, пік 2
+    const c = concurrency(
+      [
+        { key: 'A', start: at(10), stop: at(11) },
+        { key: 'B', start: at(10, 30), stop: at(11, 30) },
+      ],
+      0,
+      at(24),
+      at(23),
+    );
+    expect(c).toEqual({ wall: 90 * M, sum: 120 * M, peak: 2 });
+  });
+
+  it('записи одного потоку не подвоюються', () => {
+    const c = concurrency(
+      [
+        { key: 'A', start: at(10), stop: at(11) },
+        { key: 'A', start: at(10, 30), stop: at(11, 30) },
+      ],
+      0,
+      at(24),
+      at(23),
+    );
+    expect(c).toEqual({ wall: 90 * M, sum: 90 * M, peak: 1 });
+  });
+
+  it('запущений потік рахується до now і обрізається межами', () => {
+    const c = concurrency([{ key: 'A', start: at(10), stop: null }], at(10, 30), at(24), at(11));
+    expect(c).toEqual({ wall: 30 * M, sum: 30 * M, peak: 1 });
   });
 });

@@ -10,7 +10,7 @@
  * Правило: КОЖЕН запит до projects / tasks / time_entries / agent_sessions / session_tasks /
  * focus_switches / project_paths має умову user_id = uid (крім cron closeStale, що працює для всіх).
  */
-import { allocate, type Mode } from './allocate';
+import { allocate, concurrency, type Mode } from './allocate';
 import { days as dayRanges } from './time';
 
 export class TimerError extends Error {
@@ -1006,6 +1006,30 @@ export interface TimelineLane {
   total_ms: number;
   /** Об'єднані інтервали проєкту, обрізані межами дня; stop = null — іде зараз. */
   intervals: [number, number | null][];
+  /** Потоки проєкту (сесії агентів, таймери задач, ручний таймер) — для розгорнутої смуги. */
+  streams: TimelineStream[];
+}
+
+export interface TimelineStream {
+  key: string;
+  kind: 'agent' | 'mcp' | 'manual';
+  /** Підпис рядка: задача, нотатка або вид потоку. */
+  label: string;
+  total_ms: number;
+  segments: TimelineSegment[];
+}
+
+export interface TimelineSegment {
+  entry_id: string;
+  /** Запис цілком (без обрізання межами дня) — для правки. */
+  entry_started_at: number;
+  entry_stopped_at: number | null;
+  start: number;
+  /** null — іде зараз. */
+  stop: number | null;
+  task_title: string | null;
+  task_ref: string | null;
+  note: string | null;
 }
 
 export interface Timeline {
@@ -1013,18 +1037,86 @@ export interface Timeline {
   to: number;
   now: number;
   wall_ms: number;
+  /** Сума по проєктах: кожен проєкт — увесь свій час (кілька сесій одного проєкту — один раз). */
   sum_full_ms: number;
+  /** Сума по потоках: кожна сесія агента, таймер задачі й ручний таймер — окремо. */
+  sum_streams_ms: number;
+  /** sum_streams / wall: скільки потоків роботи в середньому йшло одночасно. */
   parallelism: number;
+  /** Найбільше потоків одночасно. */
+  peak_streams: number;
   lanes: TimelineLane[];
+}
+
+/** Потік роботи запису: сесія агента (і таймер задачі MCP) — своя; ручні таймери — по одному на проєкт. */
+function streamKey(e: { session_id: string; project_id: string }): string {
+  return e.session_id === MANUAL ? `manual:${e.project_id}` : e.session_id;
+}
+
+/** Потоки одного проєкту за день: сегменти обрізані межами, підпис — задача або нотатка. */
+function laneStreams(
+  rows: { id: string; session_id: string; project_id: string; started_at: number; stopped_at: number | null; note: string | null; task_title: string | null; task_ref: string | null }[],
+  from: number,
+  end: number,
+  now: number,
+): TimelineStream[] {
+  const by = new Map<string, TimelineStream>();
+  for (const r of rows) {
+    const st = Math.max(r.started_at, from);
+    const x = Math.min(r.stopped_at ?? now, end);
+    if (x <= st) continue;
+    const key = streamKey(r);
+    const kind: TimelineStream['kind'] = r.session_id === MANUAL ? 'manual' : isMcpSession(r.session_id) ? 'mcp' : 'agent';
+    let stream = by.get(key);
+    if (!stream) {
+      stream = { key, kind, label: '', total_ms: 0, segments: [] };
+      by.set(key, stream);
+    }
+    stream.total_ms += x - st;
+    stream.segments.push({
+      entry_id: r.id,
+      entry_started_at: r.started_at,
+      entry_stopped_at: r.stopped_at,
+      start: st,
+      stop: r.stopped_at === null && x >= end ? null : x,
+      task_title: r.task_title,
+      task_ref: r.task_ref,
+      note: r.note,
+    });
+  }
+  for (const st of by.values()) {
+    // Підпис — остання задача потоку, інакше остання нотатка, інакше вид.
+    const last = [...st.segments].reverse();
+    const task = last.find((g) => g.task_title);
+    const note = last.find((g) => g.note);
+    st.label = task
+      ? `${task.task_ref ? `${task.task_ref} ` : ''}${task.task_title}`
+      : (note?.note ?? (st.kind === 'manual' ? 'Вручну' : st.kind === 'mcp' ? 'Задача через MCP' : `Сесія ${st.key.split(':').pop()?.slice(0, 6) ?? ''} · без задачі`));
+  }
+  return [...by.values()].sort((a, b) => a.segments[0].start - b.segments[0].start);
 }
 
 /** Шкала дня: коли працював кожен проєкт і скільки разом. */
 export async function dayTimeline(s: Scope, from: number, to: number, now: number): Promise<Timeline> {
   const entries = (
     await s.db
-      .prepare('SELECT project_id, started_at, stopped_at FROM time_entries WHERE user_id = ? AND started_at < ? AND (stopped_at IS NULL OR stopped_at > ?)')
+      .prepare(
+        `SELECT e.id, e.project_id, e.session_id, e.started_at, e.stopped_at, e.note, t.title AS task_title, t.external_ref AS task_ref
+         FROM time_entries e LEFT JOIN tasks t ON t.id = e.task_id AND t.user_id = e.user_id
+         WHERE e.user_id = ? AND e.started_at < ? AND (e.stopped_at IS NULL OR e.stopped_at > ?)
+         ORDER BY e.started_at`,
+      )
       .bind(s.uid, to, from)
-      .all<{ project_id: string; started_at: number; stopped_at: number | null }>()
+      .all<{
+        id: string;
+        project_id: string;
+        session_id: string;
+        started_at: number;
+        stopped_at: number | null;
+        note: string | null;
+        task_title: string | null;
+        task_ref: string | null;
+      }>()
   ).results;
   const end = Math.min(to, now);
   const full = allocate(
@@ -1060,11 +1152,28 @@ export async function dayTimeline(s: Scope, from: number, to: number, now: numbe
       color: p?.color ?? null,
       total_ms: full.perTask[pid] ?? 0,
       intervals: merged.map((m) => [m.s, m.live && m.e >= end ? null : m.e] as [number, number | null]),
+      streams: laneStreams(entries.filter((e) => e.project_id === pid), from, end, now),
     };
   });
   lanes.sort((a, b) => b.total_ms - a.total_ms);
   const sum = Object.values(full.perTask).reduce((a, b) => a + b, 0);
-  return { from, to, now, wall_ms: full.wall, sum_full_ms: sum, parallelism: full.wall ? sum / full.wall : 0, lanes };
+  const st = concurrency(
+    entries.map((e) => ({ key: streamKey(e), start: e.started_at, stop: e.stopped_at })),
+    from,
+    end,
+    now,
+  );
+  return {
+    from,
+    to,
+    now,
+    wall_ms: full.wall,
+    sum_full_ms: sum,
+    sum_streams_ms: st.sum,
+    parallelism: st.wall ? st.sum / st.wall : 0,
+    peak_streams: st.peak,
+    lanes,
+  };
 }
 
 // ───────────────────────────── Ручний таймер ─────────────────────────────
@@ -1332,8 +1441,12 @@ export interface Report {
   wall_ms: number;
   /** Сума в повному режимі (кожен проєкт — весь свій час). */
   sum_full_ms: number;
-  /** sum_full / wall: скільки проєктів у середньому йшло одночасно. */
+  /** Сума по потоках: кожна сесія агента, таймер задачі й ручний таймер — окремо. */
+  sum_streams_ms: number;
+  /** sum_streams / wall: скільки потоків роботи (сесій, задач) у середньому йшло одночасно. */
   parallelism: number;
+  /** Найбільше потоків одночасно. */
+  peak_streams: number;
   /** Середнє за день = реальний час / дні з записами (як у Toggl). */
   avg_daily_ms: number;
   days_with_entries: number;
@@ -1341,7 +1454,7 @@ export interface Report {
   projects: ReportRow[];
   /** Задачі з часом за період, за спаданням (до 50). */
   tasks: ReportTaskRow[];
-  days: { date: string; wall_ms: number; sum_full_ms: number; projects: Record<string, number> }[];
+  days: { date: string; wall_ms: number; sum_full_ms: number; sum_streams_ms: number; projects: Record<string, number> }[];
 }
 
 /** Найдовший звіт: рік — щоб один запит не перебирав усю історію. */
@@ -1358,13 +1471,14 @@ export async function report(
   const entries = (
     await s.db
       .prepare(
-        `SELECT project_id, task_id, started_at, stopped_at FROM time_entries
+        `SELECT project_id, task_id, session_id, started_at, stopped_at FROM time_entries
          WHERE user_id = ? AND started_at < ? AND (stopped_at IS NULL OR stopped_at > ?)${q.projectId ? ' AND project_id = ?' : ''}`,
       )
       .bind(...(q.projectId ? [s.uid, to, q.from, q.projectId] : [s.uid, to, q.from]))
-      .all<{ project_id: string; task_id: string | null; started_at: number; stopped_at: number | null }>()
+      .all<{ project_id: string; task_id: string | null; session_id: string; started_at: number; stopped_at: number | null }>()
   ).results;
   const intervals = entries.map((e) => ({ taskId: e.project_id, start: e.started_at, stop: e.stopped_at }));
+  const streams = entries.map((e) => ({ key: streamKey(e), start: e.started_at, stop: e.stopped_at }));
 
   const focus =
     q.mode === 'focus'
@@ -1383,6 +1497,7 @@ export async function report(
   const main = allocate(intervals, q.from, to, now, q.mode, focus);
   const full = q.mode === 'full' ? main : allocate(intervals, q.from, to, now, 'full');
   const sumFull = Object.values(full.perTask).reduce((a, b) => a + b, 0);
+  const st = concurrency(streams, q.from, to, now);
 
   const projects = new Map((await listProjects(s, true)).map((p) => [p.id, p]));
   const rows: ReportRow[] = Object.entries(main.perTask)
@@ -1405,12 +1520,18 @@ export async function report(
     .slice(0, 50);
 
   const days = dayRanges(q.from, q.to, q.tz).map((d) => {
-    if (d.start >= to) return { date: d.date, wall_ms: 0, sum_full_ms: 0, projects: {} };
+    if (d.start >= to) return { date: d.date, wall_ms: 0, sum_full_ms: 0, sum_streams_ms: 0, projects: {} };
     const st = Math.max(d.start, q.from);
     const e = Math.min(d.end, to);
     const a = allocate(intervals, st, e, now, q.mode, focus);
     const f = q.mode === 'full' ? a : allocate(intervals, st, e, now, 'full');
-    return { date: d.date, wall_ms: a.wall, sum_full_ms: Object.values(f.perTask).reduce((x, y) => x + y, 0), projects: a.perTask };
+    return {
+      date: d.date,
+      wall_ms: a.wall,
+      sum_full_ms: Object.values(f.perTask).reduce((x, y) => x + y, 0),
+      sum_streams_ms: concurrency(streams, st, e, now).sum,
+      projects: a.perTask,
+    };
   });
   const daysWith = days.filter((d) => d.wall_ms > 0).length;
 
@@ -1421,7 +1542,9 @@ export async function report(
     timezone: q.tz,
     wall_ms: main.wall,
     sum_full_ms: sumFull,
-    parallelism: main.wall > 0 ? sumFull / main.wall : 0,
+    sum_streams_ms: st.sum,
+    parallelism: st.wall > 0 ? st.sum / st.wall : 0,
+    peak_streams: st.peak,
     avg_daily_ms: daysWith > 0 ? main.wall / daysWith : 0,
     days_with_entries: daysWith,
     running_included: entries.some((e) => e.stopped_at === null),

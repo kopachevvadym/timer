@@ -47,6 +47,8 @@
     "OWNER_GITHUB_ID": "125369797",
     // Client ID GitHub OAuth App (секрет — wrangler secret put GITHUB_CLIENT_SECRET).
     "GITHUB_CLIENT_ID": "Ov23lijRU89lsUNZRLIk",
+    // Client ID Google OAuth (секрет — wrangler secret put GOOGLE_CLIENT_SECRET). Порожньо — без входу через Google.
+    "GOOGLE_CLIENT_ID": "873050231454-sum5v8hhm5qd882325maevbo0pkqj787.apps.googleusercontent.com",
     "STALE_MINUTES": "20",
     "LONG_RUNNING_HOURS": "8"
   },

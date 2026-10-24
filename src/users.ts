@@ -1,6 +1,6 @@
 /**
- * Користувачі, вхід через GitHub, сесії вебу (підписана cookie) і API-ключі для хуків / MCP.
- * Секрети: SESSION_SECRET (підпис cookie), GITHUB_CLIENT_SECRET. Ключі зберігаються лише як SHA-256.
+ * Користувачі, вхід через GitHub або Google, сесії вебу (підписана cookie) і API-ключі для хуків / MCP.
+ * Секрети: SESSION_SECRET (підпис cookie), GITHUB_CLIENT_SECRET, GOOGLE_CLIENT_SECRET. Ключі зберігаються лише як SHA-256.
  */
 import { TimerError } from './service';
 
@@ -15,6 +15,9 @@ export interface User {
   session_epoch: number;
   created_at: number;
   last_login_at: number | null;
+  /** Google: незмінний id (sub) і пошта для показу. */
+  google_sub: string | null;
+  google_email: string | null;
 }
 
 export type KeyScope = 'full' | 'hooks';
@@ -298,4 +301,90 @@ export async function githubExchange(code: string, clientId: string, clientSecre
   const u = (await userRes.json()) as GithubProfile;
   if (typeof u.id !== 'number' || typeof u.login !== 'string') throw new TimerError('Дивна відповідь GitHub', 502);
   return { id: u.id, login: u.login, name: u.name ?? null, avatar_url: u.avatar_url ?? null };
+}
+
+// ───────────── Google ─────────────
+
+export interface GoogleProfile {
+  sub: string;
+  email: string | null;
+  name: string | null;
+  picture: string | null;
+}
+
+/** Обмін коду на профіль: токен → userinfo OpenID (без розбору id_token — профіль іде прямо від Google по TLS). */
+export async function googleExchange(code: string, clientId: string, clientSecret: string, redirectUri: string): Promise<GoogleProfile> {
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+    body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' }),
+  });
+  const token = (await tokenRes.json().catch(() => ({}))) as { access_token?: string; error?: string };
+  if (!token.access_token) throw new TimerError(`Google не видав токен: ${token.error ?? tokenRes.status}`, 401);
+  const res = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { authorization: `Bearer ${token.access_token}` } });
+  if (!res.ok) throw new TimerError(`Google не віддав профіль: ${res.status}`, 401);
+  const u = (await res.json()) as { sub?: string; email?: string; email_verified?: boolean; name?: string; picture?: string };
+  if (typeof u.sub !== 'string' || !u.sub) throw new TimerError('Дивна відповідь Google', 502);
+  return {
+    sub: u.sub,
+    email: u.email && u.email_verified !== false ? u.email.slice(0, 320) : null,
+    name: u.name?.slice(0, 200) ?? null,
+    picture: u.picture?.startsWith('https://') ? u.picture.slice(0, 1000) : null,
+  };
+}
+
+/**
+ * Вхід через Google: знайомий sub → той користувач; новий → новий акаунт.
+ * За поштою з GitHub-акаунтом НЕ зливаємо: прив'язка — лише свідомо, з «Налаштувань».
+ */
+export async function loginGoogleUser(db: D1Database, g: GoogleProfile, tz: string, now: number): Promise<User> {
+  const existing = await db.prepare('SELECT * FROM users WHERE google_sub = ?').bind(g.sub).first<User>();
+  if (existing) {
+    await db
+      .prepare('UPDATE users SET google_email = ?, name = COALESCE(name, ?), avatar_url = COALESCE(avatar_url, ?), last_login_at = ? WHERE id = ?')
+      .bind(g.email, g.name, g.picture, now, existing.id)
+      .run();
+    return (await getUser(db, existing.id))!;
+  }
+  const id = crypto.randomUUID();
+  await db
+    .prepare(
+      'INSERT INTO users (id, github_id, login, name, avatar_url, timezone, note_from_prompt, created_at, last_login_at, google_sub, google_email) VALUES (?, NULL, NULL, ?, ?, ?, 0, ?, ?, ?, ?)',
+    )
+    .bind(id, g.name ?? g.email, g.picture, validTimezone(tz) ? tz : 'UTC', now, now, g.sub, g.email)
+    .run();
+  return (await getUser(db, id))!;
+}
+
+/** Прив'язати Google до користувача. Цей Google уже в іншому акаунті — 409 (зливати акаунти не будемо мовчки). */
+export async function linkGoogle(db: D1Database, userId: string, g: GoogleProfile): Promise<User> {
+  const other = await db.prepare('SELECT id FROM users WHERE google_sub = ? AND id != ?').bind(g.sub, userId).first<{ id: string }>();
+  if (other) throw new TimerError('Цей акаунт Google уже прив’язаний до іншого користувача трекера', 409);
+  await db
+    .prepare('UPDATE users SET google_sub = ?, google_email = ?, name = COALESCE(name, ?), avatar_url = COALESCE(avatar_url, ?) WHERE id = ?')
+    .bind(g.sub, g.email, g.name, g.picture, userId)
+    .run();
+  return (await getUser(db, userId))!;
+}
+
+/** Прив'язати GitHub до користувача (напр. того, хто зайшов через Google). */
+export async function linkGithub(db: D1Database, userId: string, gh: GithubProfile): Promise<User> {
+  const other = await db.prepare('SELECT id FROM users WHERE github_id = ? AND id != ?').bind(gh.id, userId).first<{ id: string }>();
+  if (other) throw new TimerError('Цей акаунт GitHub уже прив’язаний до іншого користувача трекера', 409);
+  await db
+    .prepare('UPDATE users SET github_id = ?, login = ?, name = COALESCE(name, ?), avatar_url = COALESCE(avatar_url, ?) WHERE id = ?')
+    .bind(gh.id, gh.login, gh.name, gh.avatar_url, userId)
+    .run();
+  return (await getUser(db, userId))!;
+}
+
+/** Відв'язати спосіб входу. Останній відв'язати не можна — інакше в акаунт не увійти. */
+export async function unlinkProvider(db: D1Database, userId: string, provider: 'google' | 'github'): Promise<User> {
+  const u = await getUser(db, userId);
+  if (!u) throw new TimerError('Користувача не знайдено', 404);
+  const other = provider === 'google' ? u.github_id !== null : u.google_sub !== null;
+  if (!other) throw new TimerError('Це єдиний спосіб входу — спершу прив’яжіть інший', 409);
+  if (provider === 'google') await db.prepare('UPDATE users SET google_sub = NULL, google_email = NULL WHERE id = ?').bind(userId).run();
+  else await db.prepare('UPDATE users SET github_id = NULL WHERE id = ?').bind(userId).run();
+  return (await getUser(db, userId))!;
 }

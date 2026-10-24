@@ -6,6 +6,10 @@ interface TimerSecrets {
   SESSION_SECRET: string;
   /** wrangler secret put GITHUB_CLIENT_SECRET */
   GITHUB_CLIENT_SECRET: string;
+  /** wrangler secret put GOOGLE_CLIENT_SECRET (необов'язково: без нього кнопки Google немає). */
+  GOOGLE_CLIENT_SECRET?: string;
+  /** Client ID Google OAuth (vars у wrangler.jsonc). */
+  GOOGLE_CLIENT_ID?: string;
   /** Додає OAuthProvider для defaultHandler. */
   OAUTH_PROVIDER: OAuthHelpers;
 }

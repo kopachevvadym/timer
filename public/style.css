@@ -68,6 +68,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* ── шапка */
 .top { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
 .logo { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: 16px; font-weight: 500; }
+/* Поки йде хоча б один запис, логотип — суцільний червоний круг (як і іконка вкладки в app.js). */
+.logo circle { transition: fill .2s, stroke .2s; }
+.logo.running circle { fill: #E5322D; stroke: #E5322D; }
 .tabs { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; }
 .tabs a[aria-current="page"] { color: var(--ink); font-weight: 500; }
 
@@ -325,3 +328,20 @@ details.card > summary::marker { color: var(--muted); }
 .list.nested .sess .name { font-weight: 500; }
 .list.nested .sess .big { font-size: 18px; }
 @media (max-width: 640px) { .list.nested { margin-left: 20px; } }
+
+/* ── шкала дня: розгортання смуги проєкту на потоки (сесії, задачі, ручний таймер) */
+.lane-group { display: flex; flex-direction: column; gap: 6px; }
+.lane-toggle { all: unset; display: flex; align-items: center; gap: 4px; min-width: 0; cursor: pointer; font-size: 13px; color: var(--ink-2); border-radius: 6px; }
+.lane-toggle:hover .lane-name { color: var(--ink); }
+.lane-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lane-toggle .chev { flex: none; width: 12px; font-size: 11px; color: var(--muted); }
+.lane-toggle .lane-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lane-toggle .lane-count { flex: none; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.lane.sub > .n { padding-left: 16px; font-size: 12px; color: var(--muted); }
+.lane.sub > .t { font-size: 12px; color: var(--muted); font-weight: 400; }
+.lane.sub .track { height: 6px; }
+.track > .seg { all: unset; position: absolute; top: 0; bottom: 0; border-radius: 3px; background: var(--c); min-width: 3px; cursor: pointer; opacity: .85; }
+.track > .seg.manual { background: repeating-linear-gradient(45deg, var(--c) 0 4px, color-mix(in srgb, var(--c) 55%, transparent) 4px 8px); }
+.track > .seg:hover, .track > .seg:focus-visible { opacity: 1; outline: 2px solid var(--ink); outline-offset: 1px; z-index: 1; }
+@media (max-width: 640px) { .lane.sub > .n { padding-left: 8px; } }
+.track > .nowline { pointer-events: none; }

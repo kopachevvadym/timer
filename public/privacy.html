@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Політика конфіденційності · timer</title>
+  <link rel="icon" href="/icon.png" />
+  <style>
+    :root { color-scheme: light dark; --bg: #F6F6F3; --card: #fff; --ink: #111110; --muted: #6E6E68; --ring: #E7E7E2; --accent: #2B59FF; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #121211; --card: #1B1B1A; --ink: #EDEDE8; --muted: #9A9A93; --ring: #2B2B29; --accent: #7B97FF; } }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    main { max-width: 720px; margin: 0 auto; padding: 40px 16px 64px; }
+    a { color: var(--accent); }
+    .brand { display: inline-flex; align-items: center; gap: 8px; font-family: ui-monospace, monospace; font-weight: 600; color: var(--ink); text-decoration: none; margin-bottom: 28px; }
+    h1 { font-size: 28px; line-height: 1.25; margin: 0 0 6px; }
+    h2 { font-size: 18px; margin: 32px 0 8px; }
+    p, li { color: var(--ink); }
+    .muted { color: var(--muted); font-size: 14px; }
+    ul { padding-left: 20px; }
+    .card { background: var(--card); border-radius: 14px; box-shadow: 0 0 0 1px var(--ring); padding: 4px 20px; }
+  </style>
+</head>
+<body>
+<main>
+  <a class="brand" href="/"><img src="/icon.png" alt="" width="20" height="20" /> timer</a>
+  <h1>Політика конфіденційності</h1>
+  <p class="muted">Оновлено 23 жовтня 2026 року. Сервіс: timer.kopachev.life — трекер часу AI-агентів.</p>
+
+  <h2>Коротко</h2>
+  <div class="card"><ul>
+    <li>Ми зберігаємо лише те, що потрібно для обліку часу: назви проєктів і задач, час роботи, ваш профіль для входу.</li>
+    <li>Ваш код, вміст файлів і повні промпти не зберігаються.</li>
+    <li>Ваші дані бачите тільки ви. Ми їх не продаємо, не передаємо й не показуємо реклами.</li>
+    <li>Видалити акаунт з усіма даними можна будь-коли в «Налаштуваннях» — одразу й назавжди.</li>
+  </ul></div>
+
+  <h2>Що ми зберігаємо</h2>
+  <ul>
+    <li><b>Профіль для входу.</b> GitHub: числовий id, логін, ім'я, аватар. Google: незмінний ідентифікатор акаунта (sub), пошта, ім'я, фото профілю. Також ваш часовий пояс і налаштування.</li>
+    <li><b>Облік часу.</b> Проєкти (назва, шлях до папки на вашому комп'ютері, репозиторій git), задачі (назва, нотатки, номер у трекері), записи часу (початок, кінець, ідентифікатор сесії агента).</li>
+    <li><b>Початок промпту</b> (до 140 символів) — лише якщо ви самі ввімкнули це в «Налаштуваннях». Типово вимкнено.</li>
+    <li><b>Ключі API й токени доступу</b> — лише у вигляді хешів (SHA-256); самі ключі ми не зберігаємо.</li>
+  </ul>
+
+  <h2>Дані Google</h2>
+  <p>Через вхід Google ми отримуємо лише дозволи <code>openid</code>, <code>email</code> і <code>profile</code> і використовуємо їх тільки для того, щоб упізнати вас під час входу та показати ваше ім'я й пошту в «Налаштуваннях». Ми не маємо доступу до вашої пошти, файлів чи інших сервісів Google. Використання даних, отриманих через API Google, відповідає <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noopener">Google API Services User Data Policy</a>, зокрема вимогам Limited Use.</p>
+
+  <h2>Cookie</h2>
+  <p>Лише необхідні: cookie сесії (щоб ви лишалися в системі) і тимчасова cookie під час входу (захист від підробки запиту). Аналітики й рекламних cookie немає.</p>
+
+  <h2>Де зберігаються дані</h2>
+  <p>Сервіс працює на інфраструктурі Cloudflare (Workers, D1, KV). Cloudflare обробляє дані як постачальник хостингу. Інших отримувачів немає.</p>
+
+  <h2>Видалення та ваші права</h2>
+  <p>«Налаштування» → «Небезпечна зона» → «Видалити акаунт» безповоротно видаляє профіль, проєкти, задачі, записи й ключі. Відв'язати GitHub чи Google можна там само. Ви можете будь-коли переглянути й змінити свої дані в інтерфейсі.</p>
+
+  <h2>Контакт</h2>
+  <p>Питання щодо даних — через <a href="https://github.com/kopachevvadym/timer/issues" rel="noopener">github.com/kopachevvadym/timer/issues</a>.</p>
+
+  <h2>Summary in English</h2>
+  <p class="muted">timer stores only what time tracking needs: your sign-in profile (GitHub id/login/name/avatar; Google account id, email, name, picture), project and task names, folder paths, git repository names and time entries. No source code, file contents or full prompts are stored. Google data (openid, email, profile) is used solely to identify you at sign-in, in line with the Google API Services User Data Policy including Limited Use requirements. Data is never sold or shared; hosting is provided by Cloudflare. You can delete your account and all data at any time in Settings.</p>
+  <p class="muted" style="margin-top:40px"><a href="/privacy">Політика конфіденційності</a> · <a href="/terms">Умови використання</a> · <a href="/">timer.kopachev.life</a></p>
+</main>
+</body>
+</html>

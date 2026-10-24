@@ -44,6 +44,11 @@ import {
   deleteUser,
   getUser,
   githubExchange,
+  googleExchange,
+  linkGithub,
+  linkGoogle,
+  loginGoogleUser,
+  unlinkProvider,
   listApiKeys,
   makeSessionCookie,
   randomToken,
@@ -84,28 +89,55 @@ async function limited(env: Env, key: string, binding: 'LIMITER' | 'IP_LIMITER' 
 
 const ip = (request: Request) => request.headers.get('cf-connecting-ip') ?? 'unknown';
 
-// ───────────── Вхід через GitHub ─────────────
+// ───────────── Вхід через GitHub і Google; прив'язка другого способу входу ─────────────
+
+type Provider = 'github' | 'google';
 
 interface OAuthState {
   p: 'oauth';
+  /** Провайдер — щоб стан від GitHub не прийняв колбек Google і навпаки. */
+  v: Provider;
   s: string;
   n: string;
   tz: string;
   e: number;
+  /** Прив'язка: id користувача, до якого додаємо цей спосіб входу. */
+  l?: string;
 }
 
-app.get('/auth/github', async (c) => {
-  if (!c.env.GITHUB_CLIENT_ID || !c.env.GITHUB_CLIENT_SECRET) return c.text('Вхід через GitHub ще не налаштований', 503);
+const configured = (env: Env, v: Provider) =>
+  v === 'github' ? !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) : !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+const NAMES: Record<Provider, string> = { github: 'GitHub', google: 'Google' };
+
+async function startOAuth(c: Context<AppEnv>, v: Provider): Promise<Response> {
+  if (!configured(c.env, v)) return c.text(`Вхід через ${NAMES[v]} ще не налаштований`, 503);
+  const now = Date.now();
+  const link = c.req.query('link') === '1';
+  let linkTo: string | undefined;
+  if (link) {
+    const me = await userFromSession(c.env.DB, c.env.SESSION_SECRET, c.req.raw, now);
+    if (!me) return c.html(page('Спершу увійдіть', `<p>Щоб прив’язати ${NAMES[v]}, увійдіть у трекер.</p><p><a class="btn" href="/">На головну</a></p>`), 401);
+    linkTo = me.id;
+  }
   const state = randomToken(16);
-  const next = safeNext(c.req.query('next'));
+  const next = safeNext(c.req.query('next') ?? (link ? '/#settings' : '/'));
   const zone = (c.req.query('tz') ?? '').slice(0, 64);
-  const cookie = await sign(c.env.SESSION_SECRET, { p: 'oauth', s: state, n: next, tz: zone, e: Date.now() + 10 * 60_000 } satisfies OAuthState);
-  const url = new URL('https://github.com/login/oauth/authorize');
-  url.searchParams.set('client_id', c.env.GITHUB_CLIENT_ID);
-  url.searchParams.set('redirect_uri', `${base(c.env)}/auth/github/callback`);
-  url.searchParams.set('scope', 'read:user');
+  const cookie = await sign(c.env.SESSION_SECRET, { p: 'oauth', v, s: state, n: next, tz: zone, e: now + 10 * 60_000, l: linkTo } satisfies OAuthState);
+  const redirect = `${base(c.env)}/auth/${v}/callback`;
+  const url =
+    v === 'github' ? new URL('https://github.com/login/oauth/authorize') : new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  if (v === 'github') {
+    url.searchParams.set('client_id', c.env.GITHUB_CLIENT_ID);
+    url.searchParams.set('scope', 'read:user');
+    url.searchParams.set('allow_signup', 'true');
+  } else {
+    url.searchParams.set('client_id', c.env.GOOGLE_CLIENT_ID!);
+    url.searchParams.set('scope', 'openid email profile');
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('prompt', 'select_account');
+  }
+  url.searchParams.set('redirect_uri', redirect);
   url.searchParams.set('state', state);
-  url.searchParams.set('allow_signup', 'true');
   return new Response(null, {
     status: 302,
     headers: {
@@ -114,22 +146,48 @@ app.get('/auth/github', async (c) => {
       'cache-control': 'no-store',
     },
   });
-});
+}
 
-app.get('/auth/github/callback', async (c) => {
+async function finishOAuth(c: Context<AppEnv>, v: Provider): Promise<Response> {
   const now = Date.now();
   const st = await verify<OAuthState>(c.env.SESSION_SECRET, readCookie(c.req.raw, OAUTH_STATE_COOKIE));
   const code = c.req.query('code');
-  if (!st || st.p !== 'oauth' || typeof st.s !== 'string' || st.s.length < 16 || st.e < now || !code || c.req.query('state') !== st.s) {
-    return c.html(page('Вхід не вдався', '<p>Посилання застаріло або відкрите в іншому браузері.</p><p><a class="btn" href="/auth/github">Спробувати ще раз</a></p>'), 400);
+  const retry = `<p><a class="btn" href="/auth/${v}">Спробувати ще раз</a> <a class="btn" href="/">На головну</a></p>`;
+  if (!configured(c.env, v)) return c.text(`Вхід через ${NAMES[v]} ще не налаштований`, 503);
+  if (c.req.query('error')) return c.html(page('Вхід скасовано', `<p>${NAMES[v]} не підтвердив вхід.</p>${retry}`), 400);
+  if (!st || st.p !== 'oauth' || st.v !== v || typeof st.s !== 'string' || st.s.length < 16 || st.e < now || !code || c.req.query('state') !== st.s) {
+    return c.html(page('Вхід не вдався', `<p>Посилання застаріло або відкрите в іншому браузері.</p>${retry}`), 400);
   }
-  const gh = await githubExchange(code, c.env.GITHUB_CLIENT_ID, c.env.GITHUB_CLIENT_SECRET, `${base(c.env)}/auth/github/callback`);
-  const user = await upsertGithubUser(c.env.DB, gh, c.env.OWNER_GITHUB_ID ?? '', st.tz, now);
+  const redirect = `${base(c.env)}/auth/${v}/callback`;
   const headers = new Headers({ location: safeNext(st.n), 'cache-control': 'no-store' });
-  headers.append('set-cookie', await makeSessionCookie(c.env.SESSION_SECRET, user, now));
   headers.append('set-cookie', `${OAUTH_STATE_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
-  return new Response(null, { status: 302, headers });
-});
+  try {
+    if (st.l) {
+      // Прив'язка: та сама людина, що почала, має бути й зараз у сесії.
+      const me = await userFromSession(c.env.DB, c.env.SESSION_SECRET, c.req.raw, now);
+      if (!me || me.id !== st.l) return c.html(page('Не вдалося прив’язати', `<p>Сесія змінилася — увійдіть і спробуйте ще раз.</p>${retry}`), 400);
+      if (v === 'google') await linkGoogle(c.env.DB, me.id, await googleExchange(code, c.env.GOOGLE_CLIENT_ID!, c.env.GOOGLE_CLIENT_SECRET!, redirect));
+      else await linkGithub(c.env.DB, me.id, await githubExchange(code, c.env.GITHUB_CLIENT_ID, c.env.GITHUB_CLIENT_SECRET, redirect));
+      return new Response(null, { status: 302, headers });
+    }
+    const user =
+      v === 'google'
+        ? await loginGoogleUser(c.env.DB, await googleExchange(code, c.env.GOOGLE_CLIENT_ID!, c.env.GOOGLE_CLIENT_SECRET!, redirect), st.tz, now)
+        : await upsertGithubUser(c.env.DB, await githubExchange(code, c.env.GITHUB_CLIENT_ID, c.env.GITHUB_CLIENT_SECRET, redirect), c.env.OWNER_GITHUB_ID ?? '', st.tz, now);
+    headers.append('set-cookie', await makeSessionCookie(c.env.SESSION_SECRET, user, now));
+    return new Response(null, { status: 302, headers });
+  } catch (e) {
+    if (e instanceof TimerError) return c.html(page('Вхід не вдався', `<p>${esc(e.message)}</p>${retry}`), e.status as ContentfulStatusCode);
+    throw e;
+  }
+}
+
+app.get('/auth/github', (c) => startOAuth(c, 'github'));
+app.get('/auth/github/callback', (c) => finishOAuth(c, 'github'));
+app.get('/auth/google', (c) => startOAuth(c, 'google'));
+app.get('/auth/google/callback', (c) => finishOAuth(c, 'google'));
+/** Які способи входу налаштовані — для кнопок на головній. */
+app.get('/auth/providers', (c) => c.json({ github: configured(c.env, 'github'), google: configured(c.env, 'google') }));
 
 // Лише для локальної розробки (PUBLIC_URL з http://): вхід без GitHub для тестів. У проді — 404.
 app.get('/auth/dev', async (c) => {
@@ -140,6 +198,22 @@ app.get('/auth/dev', async (c) => {
   for (const ch of login) id = (id * 31 + ch.charCodeAt(0)) % 1_000_000_000;
   const user = await upsertGithubUser(c.env.DB, { id: 900_000_000_000 + id, login, name: login, avatar_url: null }, c.env.OWNER_GITHUB_ID ?? '', 'Europe/Kyiv', Date.now());
   const cookie = await makeSessionCookie(c.env.SESSION_SECRET, user, Date.now());
+  return new Response(JSON.stringify({ user: user.id, cookie: cookie.split(';')[0] }), { headers: { 'set-cookie': cookie, 'content-type': 'application/json' } });
+});
+
+// Лише для локальної розробки: вхід/прив'язка «Google» без Google — щоб тестувати логіку акаунтів. У проді — 404.
+app.get('/auth/dev-google', async (c) => {
+  if (String((c.env as unknown as { DEV_LOGIN?: string }).DEV_LOGIN) !== '1' || !base(c.env).startsWith('http://')) return c.notFound();
+  const now = Date.now();
+  const g = { sub: (c.req.query('sub') ?? 'g1').slice(0, 64), email: c.req.query('email') ?? null, name: c.req.query('name') ?? null, picture: null };
+  if (c.req.query('link') === '1') {
+    const me = await userFromSession(c.env.DB, c.env.SESSION_SECRET, c.req.raw, now);
+    if (!me) return c.json({ error: 'not logged in' }, 401);
+    const u = await linkGoogle(c.env.DB, me.id, g);
+    return c.json({ user: u.id });
+  }
+  const user = await loginGoogleUser(c.env.DB, g, 'Europe/Kyiv', now);
+  const cookie = await makeSessionCookie(c.env.SESSION_SECRET, user, now);
   return new Response(JSON.stringify({ user: user.id, cookie: cookie.split(';')[0] }), { headers: { 'set-cookie': cookie, 'content-type': 'application/json' } });
 });
 
@@ -484,6 +558,12 @@ api.get('/me', async (c) => {
   const u = c.get('user');
   return c.json({
     user: { id: u.id, login: u.login, name: u.name, avatar_url: u.avatar_url, timezone: u.timezone, note_from_prompt: u.note_from_prompt === 1 },
+    // Способи входу: що прив'язано і що взагалі налаштовано на сервері.
+    logins: {
+      github: u.github_id !== null ? { login: u.login } : null,
+      google: u.google_sub !== null ? { email: u.google_email } : null,
+      available: { github: configured(c.env, 'github'), google: configured(c.env, 'google') },
+    },
     mcp_url: `${base(c.env)}/mcp`,
     hooks_url: `${base(c.env)}/hooks/claude`,
     keys: await listApiKeys(c.env.DB, u.id),
@@ -501,9 +581,18 @@ api.delete('/me', async (c) => {
   if (!c.get('viaCookie')) throw new TimerError('Видалити акаунт можна лише з вебу', 403);
   const b = await c.req.json<{ confirm?: string }>().catch(() => ({}) as { confirm?: string });
   const u = c.get('user');
-  if (!b.confirm || b.confirm !== (u.login ?? u.id)) throw new TimerError('Підтвердіть видалення своїм логіном GitHub');
+  const ok = [u.login, u.google_email, u.id].filter(Boolean).map((x) => x!.toLowerCase());
+  if (!b.confirm || !ok.includes(b.confirm.trim().toLowerCase())) throw new TimerError('Підтвердіть видалення своїм логіном GitHub або поштою Google');
   await deleteUser(c.env.DB, u.id);
   return new Response(null, { status: 204, headers: { 'set-cookie': clearSessionCookie } });
+});
+
+api.post('/me/unlink', async (c) => {
+  if (!c.get('viaCookie')) throw new TimerError('Лише з вебу', 403);
+  const b = await c.req.json<{ provider?: string }>().catch(() => ({}) as { provider?: string });
+  if (b.provider !== 'google' && b.provider !== 'github') throw new TimerError('provider: google | github');
+  await unlinkProvider(c.env.DB, c.get('user').id, b.provider);
+  return c.body(null, 204);
 });
 
 api.post('/keys', async (c) => {

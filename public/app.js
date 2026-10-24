@@ -9,7 +9,21 @@ const state = {
   reports: { period: 'this_week', mode: 'full' },
   entries: { period: 'this_week', q: '', selected: null, creating: false, data: null },
   projectsView: { showArchived: false },
+  expandedLanes: loadExpanded(), // проєкти, розгорнуті на шкалі дня
 };
+
+function loadExpanded() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem('timer.expandedLanes') || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+function saveExpanded() {
+  try {
+    localStorage.setItem('timer.expandedLanes', JSON.stringify([...state.expandedLanes]));
+  } catch {}
+}
 
 const PALETTE = ['#2B59FF', '#F26B1D', '#0E9F8E', '#7C5CFF', '#D23C8C', '#B98A00', '#8A8A83'];
 const PERIODS = [
@@ -285,11 +299,34 @@ function tick() {
 }
 setInterval(tick, 1000);
 
+// ───────── Іконка, поки трекер працює: великий червоний круг
+const favicon = document.querySelector('link[rel="icon"]');
+const FAVICON_IDLE = favicon.href;
+const FAVICON_RUNNING = `data:image/svg+xml,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 22'><circle cx='11' cy='11' r='10' fill='#E5322D'/></svg>")}`;
+let isRunning = false;
+
+function setRunning(on) {
+  on = Boolean(on);
+  document.querySelector('.logo')?.classList.toggle('running', on);
+  if (on === isRunning) return;
+  isRunning = on;
+  favicon.href = on ? FAVICON_RUNNING : FAVICON_IDLE;
+}
+
+// «Зараз» і «Проєкти» самі тягнуть /now; для решти екранів і фонової вкладки перевіряємо окремо.
+setInterval(() => {
+  if (!state.me) return;
+  const n = route().name;
+  if (!document.hidden && (n === 'now' || n === 'projects')) return;
+  api('/now').then((x) => setRunning(x.running.length), () => {});
+}, 30000);
+
 // ───────── Зараз
 
 async function viewNow() {
   const [now] = await Promise.all([api('/now'), loadProjects()]);
   state.now = now;
+  setRunning(now.running.length);
   state.offset = now.now - Date.now();
   state.tz = now.timezone || state.tz;
   const frag = el('div', { class: 'stack', style: { gap: '32px' } });
@@ -577,14 +614,15 @@ function todaySection(t) {
     { class: 'head' },
     el('h2', { class: 'label' }, 'Сьогодні'),
     el('span', { class: 'big-num' }, hm(t.wall_ms)),
-    t.sum_full_ms > t.wall_ms + 60000
+    t.sum_streams_ms > t.wall_ms + 60000
       ? el(
           'span',
-          { class: 'label', style: { 'font-weight': '400' } },
-          'агенти разом ',
-          el('span', { class: 'mono' }, hm(t.sum_full_ms)),
+          { class: 'label', style: { 'font-weight': '400' }, title: 'Кожна сесія агента, задача й ручний таймер — окремий потік, навіть в одному проєкті' },
+          'усі сесії разом ',
+          el('span', { class: 'mono' }, hm(t.sum_streams_ms)),
           ' · паралельно ',
           el('span', { class: 'mono', style: { color: 'var(--accent)' } }, `×${t.parallelism.toFixed(2)}`),
+          t.peak_streams > 1 ? [' · пік ', el('span', { class: 'mono' }, `${t.peak_streams}`)] : null,
         )
       : null,
   );
@@ -603,41 +641,114 @@ function todaySection(t) {
   const ticks = [];
   for (let x = start; x <= end; x += step * H) ticks.push(x);
 
-  const card = el(
-    'div',
-    {
-      class: 'card pad lanes',
-      role: 'img',
-      'aria-label': `Шкала дня ${timeOf(start)}–${timeOf(end)}: ${t.lanes.map((l) => `${l.name} ${hm(l.total_ms)}`).join(', ')}`,
-    },
-    t.lanes.map((l) =>
+  const segTitle = (st, g) => {
+    const stop = g.stop ?? t.now;
+    const what = g.task_title ? `${g.task_ref ? `${g.task_ref} ` : ''}${g.task_title}` : st.label;
+    const kind = st.kind === 'manual' ? 'вручну' : st.kind === 'mcp' ? 'задача через MCP' : 'сесія агента';
+    return [what, `${timeOf(g.start)}–${g.stop === null ? 'зараз' : timeOf(stop)} · ${hm(stop - g.start)} · ${kind}`, g.note && g.note !== what ? g.note : null]
+      .filter(Boolean)
+      .join('\n');
+  };
+  const openSeg = (l, st, g) =>
+    openEntryDialog({
+      entryId: g.entry_id,
+      startedAt: g.entry_started_at,
+      stoppedAt: g.entry_stopped_at,
+      projectId: l.project_id,
+      projectName: l.name,
+      color: l.color,
+      sub: segTitle(st, g).split('\n')[0],
+      sessionId: st.kind === 'manual' ? 'manual' : st.key,
+      manual: st.kind === 'manual',
+      waiting: false,
+    });
+
+  const laneRow = (l) => {
+    const open = state.expandedLanes.has(l.project_id);
+    const toggle = el(
+      'button',
+      {
+        type: 'button',
+        class: 'n lane-toggle',
+        'aria-expanded': String(open),
+        title: open ? 'Згорнути' : `Розгорнути: ${l.streams.length} ${l.streams.length === 1 ? 'потік' : 'потоки'}`,
+        onclick: () => {
+          if (open) state.expandedLanes.delete(l.project_id);
+          else state.expandedLanes.add(l.project_id);
+          saveExpanded();
+          card.replaceWith((card = buildCard()));
+        },
+      },
+      el('span', { class: 'chev', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
+      el('span', { class: 'lane-name' }, l.name),
+      l.streams.length > 1 ? el('span', { class: 'lane-count' }, `×${l.streams.length}`) : null,
+    );
+    const main = el(
+      'div',
+      { class: 'lane' },
+      toggle,
+      el(
+        'span',
+        { class: 'track', style: { '--c': colorOf(l.project_id, l.color) } },
+        l.intervals.map(([s, e]) =>
+          el('span', {
+            class: e === null ? 'live' : '',
+            title: `${l.name}: ${timeOf(s)}–${e === null ? 'зараз' : timeOf(e)} · ${hm((e ?? t.now) - s)}`,
+            style: { left: pos(s), width: pos(start + ((e ?? t.now) - s)) },
+          }),
+        ),
+        el('span', { class: 'nowline', style: { left: pos(t.now) } }),
+      ),
+      el('span', { class: 't' }, hm(l.total_ms)),
+    );
+    if (!open) return main;
+    const subs = l.streams.map((st) =>
       el(
         'div',
-        { class: 'lane' },
-        el('span', { class: 'n', title: l.name }, l.name),
+        { class: 'lane sub' },
+        el('span', { class: 'n', title: st.label }, st.label),
         el(
           'span',
           { class: 'track', style: { '--c': colorOf(l.project_id, l.color) } },
-          l.intervals.map(([s, e]) =>
-            el('span', { class: e === null ? 'live' : '', style: { left: pos(s), width: pos(start + ((e ?? t.now) - s)) } }),
+          st.segments.map((g) =>
+            el('button', {
+              type: 'button',
+              class: `seg${g.stop === null ? ' live' : ''}${st.kind === 'manual' ? ' manual' : ''}`,
+              title: segTitle(st, g),
+              'aria-label': segTitle(st, g).replace(/\n/g, ', '),
+              style: { left: pos(g.start), width: pos(start + ((g.stop ?? t.now) - g.start)) },
+              onclick: () => openSeg(l, st, g),
+            }),
           ),
           el('span', { class: 'nowline', style: { left: pos(t.now) } }),
         ),
-        el('span', { class: 't' }, hm(l.total_ms)),
+        el('span', { class: 't' }, hm(st.total_ms)),
       ),
-    ),
+    );
+    return el('div', { class: 'lane-group' }, main, ...subs);
+  };
+
+  const buildCard = () =>
     el(
       'div',
-      { class: 'lane ticks', 'aria-hidden': 'true' },
-      el('span'),
+      {
+        class: 'card pad lanes',
+        'aria-label': `Шкала дня ${timeOf(start)}–${timeOf(end)}: ${t.lanes.map((l) => `${l.name} ${hm(l.total_ms)}`).join(', ')}`,
+      },
+      t.lanes.map(laneRow),
       el(
-        'span',
-        { class: 'scale' },
-        ticks.map((x) => el('span', { style: { left: pos(x) } }, hourOf(x))),
+        'div',
+        { class: 'lane ticks', 'aria-hidden': 'true' },
+        el('span'),
+        el(
+          'span',
+          { class: 'scale' },
+          ticks.map((x) => el('span', { style: { left: pos(x) } }, hourOf(x))),
+        ),
+        el('span'),
       ),
-      el('span'),
-    ),
-  );
+    );
+  let card = buildCard();
   return el('section', { class: 'section', style: { gap: '12px' } }, head, card);
 }
 
@@ -664,8 +775,8 @@ async function viewReports() {
     'div',
     { class: 'tiles' },
     tile(hm(r.wall_ms), 'Реальний час'),
-    tile(hm(r.sum_full_ms), 'Агенти разом'),
-    tile(`×${(r.parallelism || 0).toFixed(2)}`, 'Паралельність', true),
+    tile(hm(r.sum_streams_ms), 'Усі сесії разом'),
+    tile(`×${(r.parallelism || 0).toFixed(2)}`, r.peak_streams > 1 ? `Паралельність · пік ${r.peak_streams}` : 'Паралельність', true),
     tile(hm(r.avg_daily_ms), `Середнє за день · ${r.days_with_entries} дн.`),
   );
 
@@ -734,7 +845,7 @@ function tile(v, k, accent = false) {
 }
 
 function daysChart(days) {
-  const max = Math.max(1, ...days.map((d) => Math.max(d.sum_full_ms, d.wall_ms)));
+  const max = Math.max(1, ...days.map((d) => Math.max(d.sum_streams_ms, d.wall_ms)));
   const many = days.length > 10;
   const today = dayKey(serverNow());
   return el(
@@ -744,14 +855,14 @@ function daysChart(days) {
       'div',
       { class: 'head' },
       el('h2', { class: 'label' }, 'По днях'),
-      el('span', { class: 'legend' }, el('span', {}, el('i'), 'реальний час'), el('span', {}, el('i', { class: 'sum' }), 'агенти разом')),
+      el('span', { class: 'legend' }, el('span', {}, el('i'), 'реальний час'), el('span', {}, el('i', { class: 'sum' }), 'усі сесії разом')),
     ),
     el(
       'div',
       { class: 'card pad chart' },
       el(
         'div',
-        { class: 'cols', role: 'img', 'aria-label': days.map((d) => `${d.date}: ${hm(d.wall_ms)} реального, ${hm(d.sum_full_ms)} разом`).join('; ') },
+        { class: 'cols', role: 'img', 'aria-label': days.map((d) => `${d.date}: ${hm(d.wall_ms)} реального, ${hm(d.sum_streams_ms)} разом`).join('; ') },
         days.map((d) => {
           const [y, m, dd] = d.date.split('-').map(Number);
           const label = many
@@ -759,12 +870,12 @@ function daysChart(days) {
             : new Intl.DateTimeFormat('uk-UA', { timeZone: 'UTC', weekday: 'short' }).format(Date.UTC(y, m - 1, dd));
           return el(
             'div',
-            { class: 'col', title: `${d.date} · реально ${hm(d.wall_ms)} · разом ${hm(d.sum_full_ms)}` },
+            { class: 'col', title: `${d.date} · реально ${hm(d.wall_ms)} · разом ${hm(d.sum_streams_ms)} · ×${d.wall_ms ? (d.sum_streams_ms / d.wall_ms).toFixed(1) : '0'}` },
             el('span', { class: 'h' }, many || !d.wall_ms ? '' : hm(d.wall_ms)),
             el(
               'span',
               { class: 'bars' },
-              el('span', { class: 'sum', style: { height: `${(d.sum_full_ms / max) * 100}%` } }),
+              el('span', { class: 'sum', style: { height: `${(d.sum_streams_ms / max) * 100}%` } }),
               el('span', { class: 'real', style: { height: `${(d.wall_ms / max) * 100}%` } }),
             ),
             el('span', { class: 'd', style: d.date === today ? { color: 'var(--ink)', 'font-weight': '500' } : {} }, label),
@@ -1008,6 +1119,7 @@ function entryPanel() {
 async function viewProjects(arg) {
   const [, now, open] = await Promise.all([loadProjects(), api('/now'), api('/tasks?status=open')]);
   state.now = now;
+  setRunning(now.running.length);
   state.offset = now.now - Date.now();
   const pv = state.projectsView;
   const active = state.projects.filter((p) => !p.archived_at);
@@ -1354,7 +1466,7 @@ const browserTz = () => {
     return 'UTC';
   }
 };
-const loginUrl = () => `/auth/github?tz=${encodeURIComponent(browserTz())}&next=${encodeURIComponent('/' + location.hash)}`;
+const loginUrl = (provider = 'github') => `/auth/${provider}?tz=${encodeURIComponent(browserTz())}&next=${encodeURIComponent('/' + location.hash)}`;
 
 function setMe(me) {
   state.me = me;
@@ -1365,7 +1477,7 @@ function setMe(me) {
   const img = a.querySelector('img');
   if (img && me.user.avatar_url) img.src = me.user.avatar_url;
   else img?.remove();
-  a.querySelector('span').textContent = me.user.login || 'Акаунт';
+  a.querySelector('span').textContent = me.user.login || me.user.name || 'Акаунт';
 }
 
 function showLanding() {
@@ -1374,6 +1486,14 @@ function showLanding() {
   clearInterval(pollTimer);
   document.body.classList.add('anon');
   document.title = 'Timer — трекер часу AI-агентів';
+  const loginButtons = el('div', { class: 'row wrap' }, el('a', { class: 'btn primary lg', href: loginUrl('github') }, githubIcon(), 'Увійти через GitHub'));
+  // Google — лише якщо налаштований на сервері.
+  fetch('/auth/providers')
+    .then((r) => (r.ok ? r.json() : null))
+    .then((p) => {
+      if (p?.google) loginButtons.append(el('a', { class: 'btn lg', href: loginUrl('google') }, googleIcon(), 'Увійти через Google'));
+    })
+    .catch(() => {});
   view.replaceChildren(
     el(
       'div',
@@ -1384,7 +1504,7 @@ function showLanding() {
         { class: 'lead' },
         'Кілька Claude Code у різних репозиторіях одночасно. Timer сам рахує час кожного агента, показує, хто чекає на вашу відповідь, і чесно ділить паралельні години між проєктами.',
       ),
-      el('div', { class: 'row wrap' }, el('a', { class: 'btn primary lg', href: loginUrl() }, githubIcon(), 'Увійти через GitHub')),
+      loginButtons,
       el('img', { class: 'shot', src: '/screenshot.png', alt: 'Екран «Зараз»: агенти, що чекають і працюють, шкала дня', loading: 'lazy' }),
       el(
         'ul',
@@ -1394,9 +1514,25 @@ function showLanding() {
         el('li', {}, el('b', {}, 'Чекають на вас. '), 'Видно, який агент простоює через вас і скільки хвилин.'),
         el('li', {}, el('b', {}, 'Ваші дані — лише ваші. '), 'Інші користувачі їх не бачать; промпти не зберігаються, доки ви самі не ввімкнете.'),
       ),
-      el('p', { class: 'hint' }, 'Відкритий код: ', el('a', { href: 'https://github.com/kopachevvadym/timer', rel: 'noopener' }, 'github.com/kopachevvadym/timer')),
+      el(
+        'p',
+        { class: 'hint' },
+        'Відкритий код: ',
+        el('a', { href: 'https://github.com/kopachevvadym/timer', rel: 'noopener' }, 'github.com/kopachevvadym/timer'),
+        ' · ',
+        el('a', { href: '/privacy' }, 'Політика конфіденційності'),
+        ' · ',
+        el('a', { href: '/terms' }, 'Умови використання'),
+      ),
     ),
   );
+}
+
+function googleIcon() {
+  const t = document.createElement('template');
+  t.innerHTML =
+    '<svg viewBox="0 0 18 18" width="16" height="16" aria-hidden="true"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.7-1.57 2.68-3.88 2.68-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.8.54-1.83.86-3.04.86-2.34 0-4.32-1.58-5.03-3.7H.96v2.33A9 9 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.97 10.72A5.4 5.4 0 0 1 3.68 9c0-.6.1-1.18.29-1.72V4.95H.96A9 9 0 0 0 0 9c0 1.45.35 2.83.96 4.05l3.01-2.33z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.58A9 9 0 0 0 .96 4.95l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>';
+  return t.content.firstChild;
 }
 
 function githubIcon() {
@@ -1555,11 +1691,12 @@ async function viewSettings() {
     render();
   });
 
-  const confirmInput = el('input', { placeholder: me.user.login ?? '', 'aria-label': 'Ваш логін GitHub для підтвердження', autocomplete: 'off', style: { 'max-width': '220px' } });
+  const confirmWord = me.user.login ?? me.logins?.google?.email ?? '';
+  const confirmInput = el('input', { placeholder: confirmWord, 'aria-label': 'Логін GitHub або пошта Google для підтвердження', autocomplete: 'off', style: { 'max-width': '260px' } });
   const danger = el(
     'form',
     { class: 'card pad stack' },
-    el('p', { class: 'hint', style: { margin: '0' } }, 'Видалити акаунт разом з усіма проєктами, задачами, записами й ключами. Цього не скасувати. Для підтвердження введіть свій логін GitHub.'),
+    el('p', { class: 'hint', style: { margin: '0' } }, `Видалити акаунт разом з усіма проєктами, задачами, записами й ключами. Цього не скасувати. Для підтвердження введіть ${me.user.login ? 'свій логін GitHub' : 'свою пошту Google'}.`),
     el('div', { class: 'row wrap', style: { gap: '8px' } }, confirmInput, el('button', { type: 'submit', class: 'btn sm danger' }, 'Видалити акаунт')),
   );
   danger.addEventListener('submit', async (ev) => {
@@ -1567,6 +1704,32 @@ async function viewSettings() {
     await act(() => api('/me', { method: 'DELETE', body: { confirm: confirmInput.value.trim() } }));
     location.href = '/';
   });
+
+  // Способи входу: GitHub і Google, прив'язати другий або відв'язати (останній — не можна).
+  const L = me.logins ?? { github: { login: me.user.login }, google: null, available: { github: true, google: false } };
+  const linked = (L.github ? 1 : 0) + (L.google ? 1 : 0);
+  const loginRow = (provider, iconEl, title, info) =>
+    el(
+      'li',
+      { class: 'sess', style: { padding: '12px 20px' } },
+      iconEl,
+      el('span', { class: 'body' }, el('span', { class: 'name', style: { 'font-weight': '500' } }, title), el('span', { class: 'sub' }, info ?? 'не прив’язано')),
+      info
+        ? linked > 1
+          ? confirmButton('Відв’язати', 'Точно відв’язати?', () =>
+              act(() => api('/me/unlink', { body: { provider } }), 'Відв’язано').then(() => render()),
+            )
+          : el('span', { class: 'hint', title: 'Спершу прив’яжіть інший спосіб входу' }, 'єдиний спосіб входу')
+        : L.available[provider]
+          ? el('a', { class: 'btn sm', href: `/auth/${provider}?link=1&next=${encodeURIComponent('/#settings')}` }, 'Прив’язати')
+          : el('span', { class: 'hint' }, 'не налаштовано на сервері'),
+    );
+  const loginsList = el(
+    'ul',
+    { class: 'list card' },
+    loginRow('github', githubIcon(), 'GitHub', L.github ? `@${L.github.login}` : null),
+    loginRow('google', googleIcon(), 'Google', L.google ? (L.google.email ?? 'прив’язано') : null),
+  );
 
   const step = (n, title, ...body) =>
     el('li', { class: 'step' }, el('span', { class: 'num mono' }, String(n)), el('div', { class: 'stack', style: { gap: '8px', 'min-width': '0' } }, el('b', {}, title), ...body));
@@ -1585,7 +1748,7 @@ async function viewSettings() {
           'div',
           { class: 'row' },
           me.user.avatar_url ? el('img', { src: me.user.avatar_url, alt: '', width: 40, height: 40, class: 'avatar' }) : null,
-          el('div', { class: 'stack', style: { gap: '0' } }, el('b', {}, me.user.name || me.user.login || 'Ви'), el('span', { class: 'muted' }, me.user.login ? `@${me.user.login}` : '')),
+          el('div', { class: 'stack', style: { gap: '0' } }, el('b', {}, me.user.name || me.user.login || 'Ви'), el('span', { class: 'muted' }, me.user.login ? `@${me.user.login}` : (me.logins?.google?.email ?? ''))),
         ),
         el(
           'button',
@@ -1601,6 +1764,7 @@ async function viewSettings() {
         ),
       ),
     ),
+    el('section', { class: 'section' }, el('h2', { class: 'label' }, 'Способи входу'), loginsList),
     el(
       'section',
       { class: 'section' },
@@ -1673,6 +1837,7 @@ api('/me')
     // Новий користувач без жодного ключа — одразу на сторінку підключення.
     if (!me.keys.length && !location.hash) location.hash = '#settings';
     render();
+    if (!['now', 'projects'].includes(route().name)) api('/now').then((x) => setRunning(x.running.length), () => {});
   })
   .catch((e) => {
     if (!(e instanceof AuthError)) view.replaceChildren(el('div', { class: 'card empty' }, e.message));
