@@ -178,8 +178,8 @@ export function validTimezone(tz: string | null | undefined): tz is string {
 
 export async function updateSettings(db: D1Database, userId: string, patch: { timezone?: string; note_from_prompt?: boolean }): Promise<User> {
   const u = await getUser(db, userId);
-  if (!u) throw new TimerError('Користувача не знайдено', 404);
-  if (patch.timezone !== undefined && !validTimezone(patch.timezone)) throw new TimerError(`Невідомий часовий пояс: ${patch.timezone}`);
+  if (!u) throw new TimerError('Користувача не знайдено', 404, 'User not found');
+  if (patch.timezone !== undefined && !validTimezone(patch.timezone)) throw new TimerError(`Невідомий часовий пояс: ${patch.timezone}`, 400, `Unknown time zone: ${patch.timezone}`);
   await db
     .prepare('UPDATE users SET timezone = ?, note_from_prompt = ? WHERE id = ?')
     .bind(patch.timezone ?? u.timezone, patch.note_from_prompt === undefined ? u.note_from_prompt : patch.note_from_prompt ? 1 : 0, userId)
@@ -218,7 +218,7 @@ export async function createApiKey(
 ): Promise<{ key: string; info: ApiKey }> {
   if (scope !== 'full' && scope !== 'hooks') throw new TimerError('scope: full | hooks');
   const n = await db.prepare('SELECT COUNT(*) AS n FROM api_keys WHERE user_id = ? AND revoked_at IS NULL').bind(userId).first<{ n: number }>();
-  if ((n?.n ?? 0) >= MAX_KEYS) throw new TimerError(`Щонайбільше ${MAX_KEYS} активних ключів — відкличте зайві`, 429);
+  if ((n?.n ?? 0) >= MAX_KEYS) throw new TimerError(`Щонайбільше ${MAX_KEYS} активних ключів — відкличте зайві`, 429, `At most ${MAX_KEYS} active keys — revoke some`);
   const key = `${KEY_PREFIX}${randomToken(32)}`;
   const id = crypto.randomUUID();
   const clean = (name || 'Claude Code').replace(/\s+/g, ' ').trim().slice(0, 60) || 'Claude Code';
@@ -240,7 +240,7 @@ export async function listApiKeys(db: D1Database, userId: string): Promise<ApiKe
 
 export async function revokeApiKey(db: D1Database, userId: string, id: string, now: number): Promise<void> {
   const r = await db.prepare('UPDATE api_keys SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL').bind(now, id, userId).run();
-  if ((r.meta.changes ?? 0) === 0) throw new TimerError('Ключ не знайдено', 404);
+  if ((r.meta.changes ?? 0) === 0) throw new TimerError('Ключ не знайдено', 404, 'Key not found');
 }
 
 /**
@@ -293,13 +293,13 @@ export async function githubExchange(code: string, clientId: string, clientSecre
     body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
   });
   const token = (await tokenRes.json().catch(() => ({}))) as { access_token?: string; error?: string };
-  if (!token.access_token) throw new TimerError(`GitHub не видав токен: ${token.error ?? tokenRes.status}`, 401);
+  if (!token.access_token) throw new TimerError(`GitHub не видав токен: ${token.error ?? tokenRes.status}`, 401, `GitHub did not issue a token: ${token.error ?? tokenRes.status}`);
   const userRes = await fetch('https://api.github.com/user', {
     headers: { authorization: `Bearer ${token.access_token}`, accept: 'application/vnd.github+json', 'user-agent': 'timer' },
   });
-  if (!userRes.ok) throw new TimerError(`GitHub не віддав профіль: ${userRes.status}`, 401);
+  if (!userRes.ok) throw new TimerError(`GitHub не віддав профіль: ${userRes.status}`, 401, `GitHub did not return the profile: ${userRes.status}`);
   const u = (await userRes.json()) as GithubProfile;
-  if (typeof u.id !== 'number' || typeof u.login !== 'string') throw new TimerError('Дивна відповідь GitHub', 502);
+  if (typeof u.id !== 'number' || typeof u.login !== 'string') throw new TimerError('Дивна відповідь GitHub', 502, 'Unexpected response from GitHub');
   return { id: u.id, login: u.login, name: u.name ?? null, avatar_url: u.avatar_url ?? null };
 }
 
@@ -320,11 +320,11 @@ export async function googleExchange(code: string, clientId: string, clientSecre
     body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' }),
   });
   const token = (await tokenRes.json().catch(() => ({}))) as { access_token?: string; error?: string };
-  if (!token.access_token) throw new TimerError(`Google не видав токен: ${token.error ?? tokenRes.status}`, 401);
+  if (!token.access_token) throw new TimerError(`Google не видав токен: ${token.error ?? tokenRes.status}`, 401, `Google did not issue a token: ${token.error ?? tokenRes.status}`);
   const res = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { authorization: `Bearer ${token.access_token}` } });
-  if (!res.ok) throw new TimerError(`Google не віддав профіль: ${res.status}`, 401);
+  if (!res.ok) throw new TimerError(`Google не віддав профіль: ${res.status}`, 401, `Google did not return the profile: ${res.status}`);
   const u = (await res.json()) as { sub?: string; email?: string; email_verified?: boolean; name?: string; picture?: string };
-  if (typeof u.sub !== 'string' || !u.sub) throw new TimerError('Дивна відповідь Google', 502);
+  if (typeof u.sub !== 'string' || !u.sub) throw new TimerError('Дивна відповідь Google', 502, 'Unexpected response from Google');
   return {
     sub: u.sub,
     email: u.email && u.email_verified !== false ? u.email.slice(0, 320) : null,
@@ -359,7 +359,7 @@ export async function loginGoogleUser(db: D1Database, g: GoogleProfile, tz: stri
 /** Прив'язати Google до користувача. Цей Google уже в іншому акаунті — 409 (зливати акаунти не будемо мовчки). */
 export async function linkGoogle(db: D1Database, userId: string, g: GoogleProfile): Promise<User> {
   const other = await db.prepare('SELECT id FROM users WHERE google_sub = ? AND id != ?').bind(g.sub, userId).first<{ id: string }>();
-  if (other) throw new TimerError('Цей акаунт Google уже прив’язаний до іншого користувача трекера', 409);
+  if (other) throw new TimerError('Цей акаунт Google уже прив’язаний до іншого користувача трекера', 409, 'This Google account is already linked to another tracker user');
   await db
     .prepare('UPDATE users SET google_sub = ?, google_email = ?, name = COALESCE(name, ?), avatar_url = COALESCE(avatar_url, ?) WHERE id = ?')
     .bind(g.sub, g.email, g.name, g.picture, userId)
@@ -370,7 +370,7 @@ export async function linkGoogle(db: D1Database, userId: string, g: GoogleProfil
 /** Прив'язати GitHub до користувача (напр. того, хто зайшов через Google). */
 export async function linkGithub(db: D1Database, userId: string, gh: GithubProfile): Promise<User> {
   const other = await db.prepare('SELECT id FROM users WHERE github_id = ? AND id != ?').bind(gh.id, userId).first<{ id: string }>();
-  if (other) throw new TimerError('Цей акаунт GitHub уже прив’язаний до іншого користувача трекера', 409);
+  if (other) throw new TimerError('Цей акаунт GitHub уже прив’язаний до іншого користувача трекера', 409, 'This GitHub account is already linked to another tracker user');
   await db
     .prepare('UPDATE users SET github_id = ?, login = ?, name = COALESCE(name, ?), avatar_url = COALESCE(avatar_url, ?) WHERE id = ?')
     .bind(gh.id, gh.login, gh.name, gh.avatar_url, userId)
@@ -381,9 +381,9 @@ export async function linkGithub(db: D1Database, userId: string, gh: GithubProfi
 /** Відв'язати спосіб входу. Останній відв'язати не можна — інакше в акаунт не увійти. */
 export async function unlinkProvider(db: D1Database, userId: string, provider: 'google' | 'github'): Promise<User> {
   const u = await getUser(db, userId);
-  if (!u) throw new TimerError('Користувача не знайдено', 404);
+  if (!u) throw new TimerError('Користувача не знайдено', 404, 'User not found');
   const other = provider === 'google' ? u.github_id !== null : u.google_sub !== null;
-  if (!other) throw new TimerError('Це єдиний спосіб входу — спершу прив’яжіть інший', 409);
+  if (!other) throw new TimerError('Це єдиний спосіб входу — спершу прив’яжіть інший', 409, 'This is your only sign-in method — link another one first');
   if (provider === 'google') await db.prepare('UPDATE users SET google_sub = NULL, google_email = NULL WHERE id = ?').bind(userId).run();
   else await db.prepare('UPDATE users SET github_id = NULL WHERE id = ?').bind(userId).run();
   return (await getUser(db, userId))!;

@@ -14,9 +14,11 @@ import { allocate, concurrency, type Mode } from './allocate';
 import { days as dayRanges } from './time';
 
 export class TimerError extends Error {
+  /** message — українською (її бачать агенти через MCP і хуки); en — для веб-інтерфейсу англійською. */
   constructor(
     message: string,
     public status = 400,
+    public en?: string,
   ) {
     super(message);
   }
@@ -171,7 +173,7 @@ async function entryQuotaExceeded(s: Scope, now: number): Promise<boolean> {
 
 async function assertEntryQuota(s: Scope, now: number) {
   if (await entryQuotaExceeded(s, now)) {
-    throw new TimerError(`Досягнуто ліміту записів (${LIMITS.entriesPerDay} за добу або ${LIMITS.entriesTotal} загалом)`, 429);
+    throw new TimerError(`Досягнуто ліміту записів (${LIMITS.entriesPerDay} за добу або ${LIMITS.entriesTotal} загалом)`, 429, `Entry limit reached (${LIMITS.entriesPerDay} per day or ${LIMITS.entriesTotal} in total)`);
   }
 }
 
@@ -189,7 +191,7 @@ function focusSwitch(s: Scope, projectId: string, now: number): D1PreparedStatem
 
 function checkColor(color: string | null | undefined): string | null {
   if (color === undefined || color === null || color === '') return null;
-  if (!COLOR_RE.test(color)) throw new TimerError('Колір — hex на кшталт #d9643a');
+  if (!COLOR_RE.test(color)) throw new TimerError('Колір — hex на кшталт #d9643a', 400, 'Color must be hex, like #d9643a');
   return color;
 }
 
@@ -232,7 +234,7 @@ export async function listProjects(s: Scope, includeArchived = false): Promise<P
 
 export async function getProject(s: Scope, id: string): Promise<Project> {
   const p = await s.db.prepare(`SELECT ${PROJECT_COLS} FROM projects WHERE id = ? AND user_id = ?`).bind(id, s.uid).first<ProjectRow>();
-  if (!p) throw new TimerError(`Проєкт ${id} не знайдено`, 404);
+  if (!p) throw new TimerError(`Проєкт ${id} не знайдено`, 404, `Project ${id} not found`);
   return (await withPaths(s, [p]))[0];
 }
 
@@ -255,10 +257,10 @@ export async function findProjectByRepo(s: Scope, repo: string): Promise<Project
 export async function setProjectRepo(s: Scope, id: string, repo: string | null): Promise<Project> {
   await getProject(s, id);
   const r = repo === null ? null : normalizeRepo(repo);
-  if (repo !== null && !r) throw new TimerError('repo: очікується owner/name або URL git remote');
+  if (repo !== null && !r) throw new TimerError('repo: очікується owner/name або URL git remote', 400, 'repo: expected owner/name or a git remote URL');
   if (r) {
     const other = await findProjectByRepo(s, r);
-    if (other && other.id !== id) throw new TimerError(`Репозиторій ${r} уже прив'язаний до «${other.name}» — об'єднайте проєкти (merge)`, 409);
+    if (other && other.id !== id) throw new TimerError(`Репозиторій ${r} уже прив'язаний до «${other.name}» — об'єднайте проєкти (merge)`, 409, `Repository ${r} is already linked to “${other.name}” — merge the projects`);
   }
   await s.db.prepare('UPDATE projects SET repo = ? WHERE id = ? AND user_id = ?').bind(r, id, s.uid).run();
   return getProject(s, id);
@@ -279,7 +281,7 @@ export async function findProjectByPath(s: Scope, cwd: string): Promise<Project 
 
 async function assertProjectQuota(s: Scope) {
   const n = await s.db.prepare('SELECT COUNT(*) AS n FROM projects WHERE user_id = ?').bind(s.uid).first<{ n: number }>();
-  if ((n?.n ?? 0) >= LIMITS.projects) throw new TimerError(`Досягнуто ліміту в ${LIMITS.projects} проєктів — об'єднайте або видаліть зайві`, 429);
+  if ((n?.n ?? 0) >= LIMITS.projects) throw new TimerError(`Досягнуто ліміту в ${LIMITS.projects} проєктів — об'єднайте або видаліть зайві`, 429, `Limit of ${LIMITS.projects} projects reached — merge or delete some`);
 }
 
 /** Знайти проєкт для cwd або створити новий з назвою останньої папки. */
@@ -296,7 +298,7 @@ export async function resolveProject(s: Scope, cwd: string, now: number): Promis
     return found;
   }
   const path = normalizePath(cwd);
-  if (!path.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(path)) throw new TimerError('cwd має бути абсолютним шляхом');
+  if (!path.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(path)) throw new TimerError('cwd має бути абсолютним шляхом', 400, 'cwd must be an absolute path');
   const base = summarize(basename(cwd), 80) ?? 'project';
   // Проєкт з такою ж назвою, створений вручну (через веб чи MCP) і ще без шляху, — це він:
   // прив'язуємо папку до нього замість дубля «назва (2)».
@@ -328,8 +330,8 @@ export async function createProject(
 ): Promise<Project> {
   const { db } = s;
   const name = summarize(input.name, 80);
-  if (!name) throw new TimerError('Потрібна назва проєкту');
-  if (await nameTaken(s, name)) throw new TimerError(`Проєкт «${name}» уже є`, 409);
+  if (!name) throw new TimerError('Потрібна назва проєкту', 400, 'A project name is required');
+  if (await nameTaken(s, name)) throw new TimerError(`Проєкт «${name}» уже є`, 409, `Project “${name}” already exists`);
   await assertProjectQuota(s);
   const id = uid();
   const stmts = [
@@ -341,7 +343,7 @@ export async function createProject(
   try {
     await db.batch(stmts);
   } catch (e) {
-    if (String(e).includes('UNIQUE')) throw new TimerError(`Шлях ${input.path} уже прив'язаний до іншого проєкту`, 409);
+    if (String(e).includes('UNIQUE')) throw new TimerError(`Шлях ${input.path} уже прив'язаний до іншого проєкту`, 409, `Path ${input.path} is already linked to another project`);
     throw e;
   }
   return getProject(s, id);
@@ -356,9 +358,9 @@ export async function updateProject(
   const { db } = s;
   const p = await getProject(s, id);
   const newName = patch.name === undefined ? undefined : summarize(patch.name, 80);
-  if (newName && (await nameTaken(s, newName, id))) throw new TimerError(`Проєкт «${newName}» уже є`, 409);
+  if (newName && (await nameTaken(s, newName, id))) throw new TimerError(`Проєкт «${newName}» уже є`, 409, `Project “${newName}” already exists`);
   if (patch.archived === false && p.archived_at !== null && (await nameTaken(s, newName || p.name, id))) {
-    throw new TimerError(`Активний проєкт «${p.name}» уже є — спершу перейменуйте один із них`, 409);
+    throw new TimerError(`Активний проєкт «${p.name}» уже є — спершу перейменуйте один із них`, 409, `An active project “${p.name}” already exists — rename one of them first`);
   }
   const name = newName || p.name;
   const color = patch.color === undefined ? p.color : checkColor(patch.color);
@@ -381,10 +383,10 @@ export async function addProjectPath(s: Scope, id: string, path: string): Promis
   const { db } = s;
   const project = await getProject(s, id);
   const p = normalizePath(path);
-  if (!p.startsWith('/') || p.length > 1000) throw new TimerError('Шлях має бути абсолютним');
-  if (project.paths.length >= LIMITS.pathsPerProject) throw new TimerError(`У проєкту вже ${LIMITS.pathsPerProject} шляхів`, 429);
+  if (!p.startsWith('/') || p.length > 1000) throw new TimerError('Шлях має бути абсолютним', 400, 'The path must be absolute');
+  if (project.paths.length >= LIMITS.pathsPerProject) throw new TimerError(`У проєкту вже ${LIMITS.pathsPerProject} шляхів`, 429, `The project already has ${LIMITS.pathsPerProject} paths`);
   const owner = await db.prepare('SELECT project_id FROM project_paths WHERE user_id = ? AND path = ?').bind(s.uid, p).first<{ project_id: string }>();
-  if (owner && owner.project_id !== id) throw new TimerError(`Шлях ${p} уже прив'язаний до іншого проєкту — об'єднайте проєкти (merge)`, 409);
+  if (owner && owner.project_id !== id) throw new TimerError(`Шлях ${p} уже прив'язаний до іншого проєкту — об'єднайте проєкти (merge)`, 409, `Path ${p} is already linked to another project — merge the projects`);
   await db.prepare('INSERT INTO project_paths (user_id, path, project_id) VALUES (?, ?, ?) ON CONFLICT(user_id, path) DO NOTHING').bind(s.uid, p, id).run();
   return getProject(s, id);
 }
@@ -398,7 +400,7 @@ export async function removeProjectPath(s: Scope, id: string, path: string): Pro
 /** Перенести записи, задачі й шляхи проєкту `fromId` у `intoId` і видалити `fromId`. */
 export async function mergeProjects(s: Scope, fromId: string, intoId: string, now: number): Promise<Project> {
   const { db, uid: u } = s;
-  if (fromId === intoId) throw new TimerError('Не можна об’єднати проєкт сам із собою');
+  if (fromId === intoId) throw new TimerError('Не можна об’єднати проєкт сам із собою', 400, 'A project can’t be merged into itself');
   // Обидва проєкти мають належати цьому користувачу — інакше 404.
   const fromProject = await getProject(s, fromId);
   await getProject(s, intoId);
@@ -412,7 +414,7 @@ export async function mergeProjects(s: Scope, fromId: string, intoId: string, no
     )
     .bind(u, fromId, intoId, MANUAL, now)
     .first();
-  if (clash) throw new TimerError('Ручні записи цих проєктів перекриваються — спершу виправте їх', 409);
+  if (clash) throw new TimerError('Ручні записи цих проєктів перекриваються — спершу виправте їх', 409, 'Manual entries of these projects overlap — fix them first');
   await db.batch([
     // Запущені записи зупиняємо, щоб не зламати «один запущений запис на сесію».
     db.prepare('UPDATE time_entries SET stopped_at = ?, last_seen_at = ? WHERE user_id = ? AND project_id = ? AND stopped_at IS NULL').bind(now, now, u, fromId),
@@ -444,7 +446,7 @@ const TASK_WITH_TIME = `
 
 export async function getTask(s: Scope, id: string, now = Date.now()): Promise<TaskWithTime> {
   const t = await s.db.prepare(`${TASK_WITH_TIME} AND t.id = ?3`).bind(now, s.uid, id).first<TaskWithTime>();
-  if (!t) throw new TimerError(`Задачу ${id} не знайдено`, 404);
+  if (!t) throw new TimerError(`Задачу ${id} не знайдено`, 404, `Task ${id} not found`);
   return t;
 }
 
@@ -498,15 +500,15 @@ export async function createTask(
   now: number,
 ): Promise<TaskWithTime> {
   const project = await getProject(s, input.project_id);
-  if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`);
+  if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`, 400, `Project “${project.name}” is archived`);
   const title = summarize(input.title, 200);
-  if (!title) throw new TimerError('Потрібна назва задачі');
+  if (!title) throw new TimerError('Потрібна назва задачі', 400, 'A task title is required');
   const n = await s.db
     .prepare('SELECT (SELECT COUNT(*) FROM tasks WHERE user_id = ?1 AND project_id = ?2) AS inProject, (SELECT COUNT(*) FROM tasks WHERE user_id = ?1) AS total')
     .bind(s.uid, project.id)
     .first<{ inProject: number; total: number }>();
-  if ((n?.inProject ?? 0) >= LIMITS.tasksPerProject) throw new TimerError(`У проєкті вже ${LIMITS.tasksPerProject} задач`, 429);
-  if ((n?.total ?? 0) >= LIMITS.tasksPerUser) throw new TimerError(`Досягнуто ліміту в ${LIMITS.tasksPerUser} задач — видаліть старі`, 429);
+  if ((n?.inProject ?? 0) >= LIMITS.tasksPerProject) throw new TimerError(`У проєкті вже ${LIMITS.tasksPerProject} задач`, 429, `The project already has ${LIMITS.tasksPerProject} tasks`);
+  if ((n?.total ?? 0) >= LIMITS.tasksPerUser) throw new TimerError(`Досягнуто ліміту в ${LIMITS.tasksPerUser} задач — видаліть старі`, 429, `Limit of ${LIMITS.tasksPerUser} tasks reached — delete old ones`);
   const id = uid();
   await s.db
     .prepare('INSERT INTO tasks (id, user_id, project_id, title, notes, status, external_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
@@ -577,7 +579,7 @@ export async function updateTask(
   const { db, uid: u } = s;
   const t = await getTask(s, id, now);
   const title = patch.title === undefined ? t.title : summarize(patch.title, 200);
-  if (!title) throw new TimerError('Назва задачі не може бути порожньою');
+  if (!title) throw new TimerError('Назва задачі не може бути порожньою', 400, 'The task title can’t be empty');
   const status = patch.status ?? t.status;
   if (!['todo', 'doing', 'done'].includes(status)) throw new TimerError('status: todo | doing | done');
   const doneAt = status === 'done' ? (t.done_at ?? now) : null;
@@ -643,7 +645,7 @@ export async function startTask(
 ): Promise<{ task: TaskWithTime; bound: boolean }> {
   const { db, uid: u } = s;
   const t = await getTask(s, taskId, now);
-  if (t.status === 'done') throw new TimerError(`Задача «${t.title}» уже виконана — відкрийте її знову (status: todo)`);
+  if (t.status === 'done') throw new TimerError(`Задача «${t.title}» уже виконана — відкрийте її знову (status: todo)`, 400, `Task “${t.title}” is already done — reopen it (status: todo)`);
   let bound = false;
   const stmts: D1PreparedStatement[] = [];
   if (t.status === 'todo') stmts.push(db.prepare("UPDATE tasks SET status = 'doing' WHERE id = ? AND user_id = ?").bind(t.id, u));
@@ -913,8 +915,8 @@ function insertEntry(
  * sessionId — внутрішній (з префіксом користувача), як його повертають listRunning / listWaiting.
  */
 export async function stopSession(s: Scope, sessionId: string, now: number): Promise<{ stopped: number }> {
-  if (!sessionId || sessionId === MANUAL) throw new TimerError('Ручні таймери зупиняються за проєктом: POST /api/projects/:id/stop');
-  if (!sessionId.startsWith(`${s.uid}:`)) throw new TimerError(`Сесію ${sessionId} не знайдено`, 404);
+  if (!sessionId || sessionId === MANUAL) throw new TimerError('Ручні таймери зупиняються за проєктом: POST /api/projects/:id/stop', 400, 'Manual timers are stopped per project: POST /api/projects/:id/stop');
+  if (!sessionId.startsWith(`${s.uid}:`)) throw new TimerError(`Сесію ${sessionId} не знайдено`, 404, `Session ${sessionId} not found`);
   const [res, sess] = await s.db.batch([
     stopSessionEntries(s, sessionId, now),
     s.db
@@ -925,7 +927,7 @@ export async function stopSession(s: Scope, sessionId: string, now: number): Pro
       .bind(now, s.uid, sessionId),
   ]);
   const stopped = res.meta.changes ?? 0;
-  if (stopped === 0 && (sess.meta.changes ?? 0) === 0) throw new TimerError(`Сесію ${sessionId} не знайдено`, 404);
+  if (stopped === 0 && (sess.meta.changes ?? 0) === 0) throw new TimerError(`Сесію ${sessionId} не знайдено`, 404, `Session ${sessionId} not found`);
   return { stopped };
 }
 
@@ -1181,7 +1183,7 @@ export async function dayTimeline(s: Scope, from: number, to: number, now: numbe
 async function checkTaskInProject(s: Scope, taskId: string | null | undefined, projectId: string, now: number) {
   if (!taskId) return null;
   const t = await getTask(s, taskId, now);
-  if (t.project_id !== projectId) throw new TimerError(`Задача «${t.title}» належить проєкту «${t.project_name}»`);
+  if (t.project_id !== projectId) throw new TimerError(`Задача «${t.title}» належить проєкту «${t.project_name}»`, 400, `Task “${t.title}” belongs to project “${t.project_name}”`);
   return t;
 }
 
@@ -1194,14 +1196,14 @@ export async function startManual(
 ): Promise<Entry> {
   const { db, uid: u } = s;
   const project = await getProject(s, projectId);
-  if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`);
+  if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`, 400, `Project “${project.name}” is archived`);
   const task = await checkTaskInProject(s, taskId, projectId, now);
-  if (task?.status === 'done') throw new TimerError(`Задача «${task.title}» уже виконана`);
+  if (task?.status === 'done') throw new TimerError(`Задача «${task.title}» уже виконана`, 400, `Task “${task.title}” is already done`);
   const running = await db
     .prepare('SELECT id FROM time_entries WHERE user_id = ? AND project_id = ? AND session_id = ? AND stopped_at IS NULL')
     .bind(u, projectId, MANUAL)
     .first();
-  if (running) throw new TimerError(`Таймер «${project.name}» уже йде`, 409);
+  if (running) throw new TimerError(`Таймер «${project.name}» уже йде`, 409, `The “${project.name}” timer is already running`);
   await assertEntryQuota(s, now);
   const stmts = [
     insertEntry(s, projectId, task?.id ?? null, MANUAL, 'manual', now, summarize(note, 500)),
@@ -1213,7 +1215,7 @@ export async function startManual(
     await db.batch(stmts);
   } catch (e) {
     // Подвійний клік: друга вставка впирається в one_running_per_session.
-    if (String(e).includes('UNIQUE')) throw new TimerError(`Таймер «${project.name}» уже йде`, 409);
+    if (String(e).includes('UNIQUE')) throw new TimerError(`Таймер «${project.name}» уже йде`, 409, `The “${project.name}” timer is already running`);
     throw e;
   }
   return (await db
@@ -1248,9 +1250,9 @@ export async function stopManual(s: Scope, now: number, projectId?: string): Pro
 export async function switchTo(s: Scope, projectId: string, note: string | null, now: number, taskId?: string | null): Promise<Entry> {
   const project = await getProject(s, projectId);
   // Перевіряємо до зупинки інших таймерів, щоб невдалий перемикач нічого не зламав.
-  if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`);
+  if (project.archived_at !== null) throw new TimerError(`Проєкт «${project.name}» в архіві`, 400, `Project “${project.name}” is archived`);
   const task = await checkTaskInProject(s, taskId, projectId, now);
-  if (task?.status === 'done') throw new TimerError(`Задача «${task.title}» уже виконана`);
+  if (task?.status === 'done') throw new TimerError(`Задача «${task.title}» уже виконана`, 400, `Task “${task.title}” is already done`);
   await stopManual(s, now);
   return startManual(s, projectId, note, now, taskId);
 }
@@ -1267,7 +1269,7 @@ async function assertNoManualOverlap(s: Scope, projectId: string, start: number,
     )
     .bind(s.uid, projectId, MANUAL, excludeId ?? '', stop, now, start)
     .first();
-  if (clash) throw new TimerError('Ручні записи одного проєкту не можуть перекриватися', 409);
+  if (clash) throw new TimerError('Ручні записи одного проєкту не можуть перекриватися', 409, 'Manual entries of one project can’t overlap');
 }
 
 export async function createEntry(
@@ -1279,10 +1281,10 @@ export async function createEntry(
   const task = await checkTaskInProject(s, input.task_id, input.project_id, now);
   const start = input.start;
   const stop = input.stop ?? (input.duration_ms !== undefined ? start + input.duration_ms : undefined);
-  if (stop === undefined) throw new TimerError('Потрібен stop або duration_ms');
-  if (!(start < stop)) throw new TimerError('Початок має бути раніше за кінець');
-  if (stop - start < MIN_MANUAL_MS) throw new TimerError('Ручний запис має тривати щонайменше хвилину');
-  if (stop > now) throw new TimerError('Кінець не може бути в майбутньому');
+  if (stop === undefined) throw new TimerError('Потрібен stop або duration_ms', 400, 'stop or duration_ms is required');
+  if (!(start < stop)) throw new TimerError('Початок має бути раніше за кінець', 400, 'The start must be before the end');
+  if (stop - start < MIN_MANUAL_MS) throw new TimerError('Ручний запис має тривати щонайменше хвилину', 400, 'A manual entry must last at least a minute');
+  if (stop > now) throw new TimerError('Кінець не може бути в майбутньому', 400, 'The end can’t be in the future');
   await assertNoManualOverlap(s, input.project_id, start, stop, now);
   await assertEntryQuota(s, now);
   const id = uid();
@@ -1299,7 +1301,7 @@ const ENTRY_COLS = 'id, project_id, task_id, session_id, source, started_at, sto
 
 export async function getEntry(s: Scope, id: string): Promise<Entry> {
   const e = await s.db.prepare(`SELECT ${ENTRY_COLS} FROM time_entries WHERE id = ? AND user_id = ?`).bind(id, s.uid).first<Entry>();
-  if (!e) throw new TimerError(`Запис ${id} не знайдено`, 404);
+  if (!e) throw new TimerError(`Запис ${id} не знайдено`, 404, `Entry ${id} not found`);
   return e;
 }
 
@@ -1319,11 +1321,11 @@ export async function updateEntry(
   let stop = e.stopped_at;
   if (patch.stop !== undefined) stop = patch.stop;
   else if (patch.duration_ms !== undefined) {
-    if (e.stopped_at === null) throw new TimerError('У запущеного запису тривалість не задається — змініть початок або зупиніть його');
+    if (e.stopped_at === null) throw new TimerError('У запущеного запису тривалість не задається — змініть початок або зупиніть його', 400, 'A running entry has no duration to set — change its start or stop it');
     stop = start + patch.duration_ms;
   }
-  if (stop !== null && !(start < stop)) throw new TimerError('Початок має бути раніше за кінець');
-  if ((stop ?? start) > now) throw new TimerError('Час не може бути в майбутньому');
+  if (stop !== null && !(start < stop)) throw new TimerError('Початок має бути раніше за кінець', 400, 'The start must be before the end');
+  if ((stop ?? start) > now) throw new TimerError('Час не може бути в майбутньому', 400, 'The time can’t be in the future');
   const projectId = patch.project_id ?? e.project_id;
   if (patch.project_id) await getProject(s, patch.project_id);
   let taskId = patch.task_id === undefined ? e.task_id : patch.task_id;
@@ -1331,7 +1333,7 @@ export async function updateEntry(
   if (patch.project_id && patch.project_id !== e.project_id && patch.task_id === undefined) taskId = null;
   await checkTaskInProject(s, taskId, projectId, now);
   if (e.session_id === MANUAL) {
-    if (stop !== null && stop - start < MIN_MANUAL_MS) throw new TimerError('Ручний запис має тривати щонайменше хвилину');
+    if (stop !== null && stop - start < MIN_MANUAL_MS) throw new TimerError('Ручний запис має тривати щонайменше хвилину', 400, 'A manual entry must last at least a minute');
     await assertNoManualOverlap(s, projectId, start, stop ?? now, now, id);
   }
   const note = patch.note === undefined ? e.note : summarize(patch.note, 500);
@@ -1341,7 +1343,7 @@ export async function updateEntry(
       .bind(start, stop, Math.max(e.last_seen_at, stop ?? start), note, projectId, taskId, id, s.uid)
       .run();
   } catch (err) {
-    if (String(err).includes('UNIQUE')) throw new TimerError('У цьому проєкті вже йде такий таймер', 409);
+    if (String(err).includes('UNIQUE')) throw new TimerError('У цьому проєкті вже йде такий таймер', 409, 'This timer is already running in this project');
     throw err;
   }
   return getEntry(s, id);
@@ -1400,7 +1402,7 @@ export async function listRunning(s: Scope): Promise<EntryWithProject[]> {
 export async function labelRunning(s: Scope, cwd: string, note: string, now: number): Promise<number> {
   const project = await findProjectByPath(s, cwd);
   if (!project) {
-    throw new TimerError(`Для ${cwd} немає проєкту — агент тут ще не стартував або шлях не прив'язаний (timer_projects add_path)`, 404);
+    throw new TimerError(`Для ${cwd} немає проєкту — агент тут ще не стартував або шлях не прив'язаний (timer_projects add_path)`, 404, `No project for ${cwd} — no agent has started here yet or the path isn’t linked (timer_projects add_path)`);
   }
   const res = await s.db
     .prepare(
@@ -1465,8 +1467,8 @@ export async function report(
   q: { from: number; to: number; mode: Mode; tz: string; projectId?: string },
   now: number,
 ): Promise<Report> {
-  if (!(q.from < q.to)) throw new TimerError('from має бути раніше за to');
-  if (q.to - q.from > MAX_REPORT_MS) throw new TimerError('Звіт — щонайбільше за рік');
+  if (!(q.from < q.to)) throw new TimerError('from має бути раніше за to', 400, 'from must be before to');
+  if (q.to - q.from > MAX_REPORT_MS) throw new TimerError('Звіт — щонайбільше за рік', 400, 'A report can cover at most a year');
   const to = Math.min(q.to, Math.max(now, q.from + 1));
   const entries = (
     await s.db

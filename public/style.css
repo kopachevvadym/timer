@@ -345,3 +345,6 @@ details.card > summary::marker { color: var(--muted); }
 .track > .seg:hover, .track > .seg:focus-visible { opacity: 1; outline: 2px solid var(--ink); outline-offset: 1px; z-index: 1; }
 @media (max-width: 640px) { .lane.sub > .n { padding-left: 8px; } }
 .track > .nowline { pointer-events: none; }
+
+/* Кнопка, що виглядає як посилання (перемикач мови на лендінгу). */
+.linklike { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }

@@ -72,9 +72,25 @@ const S = (c: Context<AppEnv>): Scope => ({ db: c.env.DB, uid: c.get('user').id 
 const tz = (c: Context<AppEnv>) => c.get('user').timezone || 'Europe/Kyiv';
 const base = (env: Env) => env.PUBLIC_URL.replace(/\/+$/, '');
 
+// ───────────── Мова відповідей: uk або en ─────────────
+// Веб-інтерфейс шле x-lang і ставить cookie lang; сторінки входу без них дивляться на мову браузера.
+// Без жодної ознаки (хуки, MCP-клієнти) — українська, як і раніше.
+type Lang = 'uk' | 'en';
+function langOf(c: Context<AppEnv>): Lang {
+  const h = c.req.header('x-lang');
+  if (h === 'uk' || h === 'en') return h;
+  const k = readCookie(c.req.raw, 'lang');
+  if (k === 'uk' || k === 'en') return k;
+  const al = c.req.header('accept-language');
+  if (al) return /(^|,)\s*uk\b/i.test(al) ? 'uk' : 'en';
+  return 'uk';
+}
+const T = (c: Context<AppEnv>, uk: string, en: string) => (langOf(c) === 'en' ? en : uk);
+const errText = (c: Context<AppEnv>, e: TimerError) => (langOf(c) === 'en' && e.en) || e.message;
+
 app.onError((err, c) => {
-  if (err instanceof TimerError) return c.json({ error: err.message }, err.status as ContentfulStatusCode);
-  if (err instanceof SyntaxError) return c.json({ error: 'Некоректний JSON' }, 400);
+  if (err instanceof TimerError) return c.json({ error: errText(c, err) }, err.status as ContentfulStatusCode);
+  if (err instanceof SyntaxError) return c.json({ error: T(c, 'Некоректний JSON', 'Invalid JSON') }, 400);
   console.error(err);
   return c.json({ error: 'Internal error' }, 500);
 });
@@ -110,13 +126,21 @@ const configured = (env: Env, v: Provider) =>
 const NAMES: Record<Provider, string> = { github: 'GitHub', google: 'Google' };
 
 async function startOAuth(c: Context<AppEnv>, v: Provider): Promise<Response> {
-  if (!configured(c.env, v)) return c.text(`Вхід через ${NAMES[v]} ще не налаштований`, 503);
+  if (!configured(c.env, v)) return c.text(T(c, `Вхід через ${NAMES[v]} ще не налаштований`, `Sign-in with ${NAMES[v]} is not configured yet`), 503);
   const now = Date.now();
   const link = c.req.query('link') === '1';
   let linkTo: string | undefined;
   if (link) {
     const me = await userFromSession(c.env.DB, c.env.SESSION_SECRET, c.req.raw, now);
-    if (!me) return c.html(page('Спершу увійдіть', `<p>Щоб прив’язати ${NAMES[v]}, увійдіть у трекер.</p><p><a class="btn" href="/">На головну</a></p>`), 401);
+    if (!me)
+      return c.html(
+        page(
+          T(c, 'Спершу увійдіть', 'Sign in first'),
+          T(c, `<p>Щоб прив’язати ${NAMES[v]}, увійдіть у трекер.</p><p><a class="btn" href="/">На головну</a></p>`, `<p>To link ${NAMES[v]}, sign in to the tracker.</p><p><a class="btn" href="/">Home</a></p>`),
+          langOf(c),
+        ),
+        401,
+      );
     linkTo = me.id;
   }
   const state = randomToken(16);
@@ -152,11 +176,20 @@ async function finishOAuth(c: Context<AppEnv>, v: Provider): Promise<Response> {
   const now = Date.now();
   const st = await verify<OAuthState>(c.env.SESSION_SECRET, readCookie(c.req.raw, OAUTH_STATE_COOKIE));
   const code = c.req.query('code');
-  const retry = `<p><a class="btn" href="/auth/${v}">Спробувати ще раз</a> <a class="btn" href="/">На головну</a></p>`;
-  if (!configured(c.env, v)) return c.text(`Вхід через ${NAMES[v]} ще не налаштований`, 503);
-  if (c.req.query('error')) return c.html(page('Вхід скасовано', `<p>${NAMES[v]} не підтвердив вхід.</p>${retry}`), 400);
+  const lang = langOf(c);
+  const retry = T(
+    c,
+    `<p><a class="btn" href="/auth/${v}">Спробувати ще раз</a> <a class="btn" href="/">На головну</a></p>`,
+    `<p><a class="btn" href="/auth/${v}">Try again</a> <a class="btn" href="/">Home</a></p>`,
+  );
+  if (!configured(c.env, v)) return c.text(T(c, `Вхід через ${NAMES[v]} ще не налаштований`, `Sign-in with ${NAMES[v]} is not configured yet`), 503);
+  if (c.req.query('error'))
+    return c.html(page(T(c, 'Вхід скасовано', 'Sign-in cancelled'), T(c, `<p>${NAMES[v]} не підтвердив вхід.</p>`, `<p>${NAMES[v]} did not confirm the sign-in.</p>`) + retry, lang), 400);
   if (!st || st.p !== 'oauth' || st.v !== v || typeof st.s !== 'string' || st.s.length < 16 || st.e < now || !code || c.req.query('state') !== st.s) {
-    return c.html(page('Вхід не вдався', `<p>Посилання застаріло або відкрите в іншому браузері.</p>${retry}`), 400);
+    return c.html(
+      page(T(c, 'Вхід не вдався', 'Sign-in failed'), T(c, '<p>Посилання застаріло або відкрите в іншому браузері.</p>', '<p>The link has expired or was opened in another browser.</p>') + retry, lang),
+      400,
+    );
   }
   const redirect = `${base(c.env)}/auth/${v}/callback`;
   const headers = new Headers({ location: safeNext(st.n), 'cache-control': 'no-store' });
@@ -165,7 +198,8 @@ async function finishOAuth(c: Context<AppEnv>, v: Provider): Promise<Response> {
     if (st.l) {
       // Прив'язка: та сама людина, що почала, має бути й зараз у сесії.
       const me = await userFromSession(c.env.DB, c.env.SESSION_SECRET, c.req.raw, now);
-      if (!me || me.id !== st.l) return c.html(page('Не вдалося прив’язати', `<p>Сесія змінилася — увійдіть і спробуйте ще раз.</p>${retry}`), 400);
+      if (!me || me.id !== st.l)
+        return c.html(page(T(c, 'Не вдалося прив’язати', 'Could not link'), T(c, '<p>Сесія змінилася — увійдіть і спробуйте ще раз.</p>', '<p>Your session changed — sign in and try again.</p>') + retry, lang), 400);
       if (v === 'google') await linkGoogle(c.env.DB, me.id, await googleExchange(code, c.env.GOOGLE_CLIENT_ID!, c.env.GOOGLE_CLIENT_SECRET!, redirect));
       else await linkGithub(c.env.DB, me.id, await githubExchange(code, c.env.GITHUB_CLIENT_ID, c.env.GITHUB_CLIENT_SECRET, redirect));
       return new Response(null, { status: 302, headers });
@@ -177,7 +211,7 @@ async function finishOAuth(c: Context<AppEnv>, v: Provider): Promise<Response> {
     headers.append('set-cookie', await makeSessionCookie(c.env.SESSION_SECRET, user, now));
     return new Response(null, { status: 302, headers });
   } catch (e) {
-    if (e instanceof TimerError) return c.html(page('Вхід не вдався', `<p>${esc(e.message)}</p>${retry}`), e.status as ContentfulStatusCode);
+    if (e instanceof TimerError) return c.html(page(T(c, 'Вхід не вдався', 'Sign-in failed'), `<p>${esc(errText(c, e))}</p>${retry}`, lang), e.status as ContentfulStatusCode);
     throw e;
   }
 }
@@ -246,8 +280,8 @@ function unsafeBody(c: Context<AppEnv>): boolean {
 
 const esc = (v: string) => v.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
 
-function page(title: string, body: string): string {
-  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+function page(title: string, body: string, lang: Lang = 'uk'): string {
+  return `<!doctype html><html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)} · timer</title><style>
 :root{color-scheme:light dark;--bg:#F6F6F3;--card:#fff;--ink:#111110;--muted:#6E6E68;--ring:#E7E7E2}
 @media (prefers-color-scheme:dark){:root{--bg:#121211;--card:#1B1B1A;--ink:#EDEDE8;--muted:#9A9A93;--ring:#2B2B29}}
@@ -259,7 +293,21 @@ h1{font-size:19px;margin:0 0 12px}p{margin:0 0 12px;color:var(--muted)}b{color:v
 </style></head><body><main>${body}</main></body></html>`;
 }
 
-function consentPage(d: ConsentDescription, handle: string, user: User): string {
+function consentPage(d: ConsentDescription, handle: string, user: User, lang: Lang): string {
+  const form = (approve: string, deny: string) => `<form method="post"><input type="hidden" name="handle" value="${esc(handle)}">
+<div class="row"><button class="btn primary" name="decision" value="approve">${approve}</button><button class="btn" name="decision" value="deny">${deny}</button></div></form>`;
+  if (lang === 'en') {
+    const who = d.clientDomain ? `An app from <b>${esc(d.clientDomain)}</b>.` : 'The app registered itself — its name is not verified.';
+    return page(
+      'Tracker access',
+      `<h1>Give “${esc(d.clientName)}” access to your tracker?</h1>
+<p>${who}</p>
+<p>The token goes to <b>${esc(d.redirectHost)}</b>. It will be able to read and change your projects, tasks and time entries on behalf of <b>${esc(user.login ?? user.name ?? 'you')}</b>.</p>
+${d.redirectIsLoopback ? '<p class="warn"><b>Access goes to an app on your computer.</b> Approve only if you just started the connection yourself.</p>' : ''}
+${form('Allow', 'Deny')}`,
+      'en',
+    );
+  }
   const who = d.clientDomain ? `Застосунок від <b>${esc(d.clientDomain)}</b>.` : 'Застосунок зареєструвався сам — його назва не перевірена.';
   return page(
     'Доступ до трекера',
@@ -267,8 +315,7 @@ function consentPage(d: ConsentDescription, handle: string, user: User): string 
 <p>${who}</p>
 <p>Токен отримає <b>${esc(d.redirectHost)}</b>. Він зможе читати й змінювати ваші проєкти, задачі й записи часу від імені <b>${esc(user.login ?? user.name ?? 'вас')}</b>.</p>
 ${d.redirectIsLoopback ? '<p class="warn"><b>Доступ піде застосунку на вашому комп’ютері.</b> Погоджуйтеся, лише якщо ви щойно самі почали підключення.</p>' : ''}
-<form method="post"><input type="hidden" name="handle" value="${esc(handle)}">
-<div class="row"><button class="btn primary" name="decision" value="approve">Дозволити</button><button class="btn" name="decision" value="deny">Відмовити</button></div></form>`,
+${form('Дозволити', 'Відмовити')}`,
   );
 }
 
@@ -287,9 +334,10 @@ async function authorize(c: Context<AppEnv>): Promise<Response> {
       const details = await oauth.describeConsent(request);
       const consent = await oauth.beginConsent(request);
       consent.headers.set('content-type', 'text/html; charset=utf-8');
-      return new Response(consentPage(details, consent.handle, user), { headers: consent.headers });
+      return new Response(consentPage(details, consent.handle, user, langOf(c)), { headers: consent.headers });
     }
-    if (!user) return c.html(page('Сесія закінчилась', '<p>Увійдіть ще раз і повторіть підключення в застосунку.</p>'), 401);
+    if (!user)
+      return c.html(page(T(c, 'Сесія закінчилась', 'Session expired'), T(c, '<p>Увійдіть ще раз і повторіть підключення в застосунку.</p>', '<p>Sign in again and repeat the connection in the app.</p>'), langOf(c)), 401);
     const form = await c.req.formData();
     const handle = String(form.get('handle') ?? '');
     if (form.get('decision') !== 'approve') {
@@ -309,8 +357,15 @@ async function authorize(c: Context<AppEnv>): Promise<Response> {
   } catch (error) {
     if (error instanceof AuthorizationError && error.redirectTo) return Response.redirect(error.redirectTo, 302);
     if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
-      const msg = error instanceof AuthorizationError ? error.description : 'Застосунок не вдалося перевірити.';
-      return c.html(page('Підключення не вдалося', `<p>${esc(msg ?? 'Помилка запиту')}</p><p>Почніть підключення в застосунку ще раз.</p>`), 400);
+      const msg = error instanceof AuthorizationError ? error.description : T(c, 'Застосунок не вдалося перевірити.', 'The app could not be verified.');
+      return c.html(
+        page(
+          T(c, 'Підключення не вдалося', 'Connection failed'),
+          `<p>${esc(msg ?? T(c, 'Помилка запиту', 'Request error'))}</p>${T(c, '<p>Почніть підключення в застосунку ще раз.</p>', '<p>Start the connection in the app again.</p>')}`,
+          langOf(c),
+        ),
+        400,
+      );
     }
     throw error;
   }
@@ -356,14 +411,14 @@ app.use('/api/*', async (c, next) => {
   if (key) user = await userFromApiKey(c.env.DB, key, now);
   else user = await userFromSession(c.env.DB, c.env.SESSION_SECRET, c.req.raw, now);
   if (!user) {
-    if (key && (await limited(c.env, `fail:${ip(c.req.raw)}`, 'IP_LIMITER'))) return c.json({ error: 'Забагато запитів' }, 429);
+    if (key && (await limited(c.env, `fail:${ip(c.req.raw)}`, 'IP_LIMITER'))) return c.json({ error: T(c, 'Забагато запитів', 'Too many requests') }, 429);
     return c.json({ error: 'Unauthorized', login: '/auth/github' }, 401);
   }
   // CSRF: з cookie змінювати дані можна лише з цього ж сайту і лише JSON-тілом.
   if (!key && !['GET', 'HEAD', 'OPTIONS'].includes(c.req.method) && (crossSite(c) || unsafeBody(c))) {
     return c.json({ error: 'Cross-site request blocked' }, 403);
   }
-  if (await limited(c.env, `api:${user.id}`)) return c.json({ error: 'Забагато запитів, спробуйте за хвилину' }, 429);
+  if (await limited(c.env, `api:${user.id}`)) return c.json({ error: T(c, 'Забагато запитів, спробуйте за хвилину', 'Too many requests, try again in a minute') }, 429);
   c.set('user', user);
   c.set('viaCookie', !key);
   await next();
@@ -375,7 +430,7 @@ const api = new Hono<AppEnv>();
 function num(v: unknown): number | undefined {
   if (v === undefined || v === null || v === '') return undefined;
   const n = Number(v);
-  if (!Number.isFinite(n)) throw new TimerError(`Очікувалось число: ${v}`);
+  if (!Number.isFinite(n)) throw new TimerError(`Очікувалось число: ${v}`, 400, `Expected a number: ${v}`);
   return n;
 }
 
@@ -500,7 +555,7 @@ api.post('/entries', async (c) => {
   const b = await c.req.json<Record<string, unknown>>();
   const zone = tz(c);
   const start = instant(b.start, zone);
-  if (start === undefined) throw new TimerError('Потрібен start');
+  if (start === undefined) throw new TimerError('Потрібен start', 400, 'start is required');
   return c.json(
     await createEntry(
       S(c),
@@ -578,17 +633,17 @@ api.patch('/me', async (c) => {
 
 api.delete('/me', async (c) => {
   // Лише з вебу і з підтвердженням логіном — щоб ключ із хуків не міг стерти акаунт.
-  if (!c.get('viaCookie')) throw new TimerError('Видалити акаунт можна лише з вебу', 403);
+  if (!c.get('viaCookie')) throw new TimerError('Видалити акаунт можна лише з вебу', 403, 'The account can only be deleted from the web app');
   const b = await c.req.json<{ confirm?: string }>().catch(() => ({}) as { confirm?: string });
   const u = c.get('user');
   const ok = [u.login, u.google_email, u.id].filter(Boolean).map((x) => x!.toLowerCase());
-  if (!b.confirm || !ok.includes(b.confirm.trim().toLowerCase())) throw new TimerError('Підтвердіть видалення своїм логіном GitHub або поштою Google');
+  if (!b.confirm || !ok.includes(b.confirm.trim().toLowerCase())) throw new TimerError('Підтвердіть видалення своїм логіном GitHub або поштою Google', 400, 'Confirm the deletion with your GitHub login or Google email');
   await deleteUser(c.env.DB, u.id);
   return new Response(null, { status: 204, headers: { 'set-cookie': clearSessionCookie } });
 });
 
 api.post('/me/unlink', async (c) => {
-  if (!c.get('viaCookie')) throw new TimerError('Лише з вебу', 403);
+  if (!c.get('viaCookie')) throw new TimerError('Лише з вебу', 403, 'Web app only');
   const b = await c.req.json<{ provider?: string }>().catch(() => ({}) as { provider?: string });
   if (b.provider !== 'google' && b.provider !== 'github') throw new TimerError('provider: google | github');
   await unlinkProvider(c.env.DB, c.get('user').id, b.provider);
@@ -596,13 +651,13 @@ api.post('/me/unlink', async (c) => {
 });
 
 api.post('/keys', async (c) => {
-  if (!c.get('viaCookie')) throw new TimerError('Ключі створюються лише з вебу', 403);
+  if (!c.get('viaCookie')) throw new TimerError('Ключі створюються лише з вебу', 403, 'Keys can only be created from the web app');
   const b = await c.req.json<{ name?: string; scope?: 'full' | 'hooks' }>().catch(() => ({}) as { name?: string; scope?: 'full' | 'hooks' });
   return c.json(await createApiKey(c.env.DB, c.get('user').id, b.name ?? 'Claude Code', b.scope ?? 'full', Date.now()), 201);
 });
 
 api.delete('/keys/:id', async (c) => {
-  if (!c.get('viaCookie')) throw new TimerError('Ключі відкликаються лише з вебу', 403);
+  if (!c.get('viaCookie')) throw new TimerError('Ключі відкликаються лише з вебу', 403, 'Keys can only be revoked from the web app');
   await revokeApiKey(c.env.DB, c.get('user').id, c.req.param('id'), Date.now());
   return c.body(null, 204);
 });
